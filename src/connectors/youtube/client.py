@@ -150,10 +150,10 @@ class YouTubeClient:
     async def get_transcript(self, video_id: str) -> Tuple[str, str]:
         """Get transcript using YouTube Transcript API or Whisper.
 
-        MERGED from:
-        - daigest/youtubeService.py lines 284-326 (Transcript API)
-        - daigest/youtubeService.py lines 328-434 (Whisper fallback)
-        - trender/youtube_processor.py lines 146-256 (Whisper implementation)
+        Supports multiple languages and auto-detection:
+        - If transcript_languages is specified, tries those in order
+        - If not specified or all fail, auto-detects and uses any available language
+        - Falls back to Whisper if transcript API fails
 
         Args:
             video_id: YouTube video ID
@@ -170,20 +170,54 @@ class YouTubeClient:
                 def get_transcript():
                     ytt_api = YouTubeTranscriptApi()
                     transcript_list = ytt_api.list(video_id)
-                    # Try manual transcript, then auto-generated
-                    try:
-                        transcript = transcript_list.find_transcript(['en'])
-                    except:
-                        transcript = transcript_list.find_generated_transcript(['en'])
-                    return transcript.fetch()
+
+                    # Strategy 1: Try preferred languages if specified
+                    if self.config.transcript_languages:
+                        for lang_code in self.config.transcript_languages:
+                            try:
+                                # Try manual transcript first
+                                transcript = transcript_list.find_transcript([lang_code])
+                                logger.info(f"Found manual transcript in '{lang_code}' for {video_id}")
+                                return transcript.fetch(), lang_code
+                            except:
+                                try:
+                                    # Try auto-generated
+                                    transcript = transcript_list.find_generated_transcript([lang_code])
+                                    logger.info(f"Found auto-generated transcript in '{lang_code}' for {video_id}")
+                                    return transcript.fetch(), lang_code
+                                except:
+                                    continue
+
+                        # If preferred languages all failed, log and fall through to auto-detect
+                        logger.warning(
+                            f"None of the preferred languages {self.config.transcript_languages} "
+                            f"available for {video_id}, trying auto-detection"
+                        )
+
+                    # Strategy 2: Auto-detect - use first available transcript
+                    available_transcripts = list(transcript_list)
+                    if available_transcripts:
+                        # Prefer manual over auto-generated
+                        manual = [t for t in available_transcripts if not t.is_generated]
+                        transcript = manual[0] if manual else available_transcripts[0]
+                        lang_code = transcript.language_code
+                        logger.info(
+                            f"Auto-detected transcript in '{lang_code}' "
+                            f"({'manual' if not transcript.is_generated else 'auto-generated'}) "
+                            f"for {video_id}"
+                        )
+                        return transcript.fetch(), lang_code
+
+                    # No transcripts available at all
+                    raise Exception("No transcripts available for this video")
 
                 loop = asyncio.get_event_loop()
-                transcript_data = await loop.run_in_executor(None, get_transcript)
-                full_text = ' '.join([t.text for t in transcript_data])
+                transcript_data, lang_code = await loop.run_in_executor(None, get_transcript)
+                full_text = ' '.join([t['text'] for t in transcript_data])
 
                 logger.info(
                     f"Got transcript from YouTube API for {video_id} "
-                    f"({len(full_text)} chars)"
+                    f"(language: {lang_code}, {len(full_text)} chars)"
                 )
                 return (full_text, 'youtube_api')
 

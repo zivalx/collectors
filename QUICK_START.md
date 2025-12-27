@@ -108,10 +108,11 @@ from connectors.youtube import YouTubeCollector, YouTubeClientConfig, YouTubeCol
 ### Config (Settings)
 ```python
 YouTubeClientConfig(
-    whisper_model: str = "base",        # tiny, base, small, medium, large
-    use_transcript_api: bool = True,    # Try YouTube API first
-    max_video_length: int = 3600,       # Max seconds
-    audio_format: str = "m4a"           # m4a, webm, mp3
+    whisper_model: str = "base",               # tiny, base, small, medium, large
+    use_transcript_api: bool = True,           # Try YouTube API first
+    transcript_languages: List[str] = None,    # e.g., ["iw", "he", "en"] or None for auto-detect
+    max_video_length: int = 3600,              # Max seconds
+    audio_format: str = "m4a"                  # m4a, webm, mp3
 )
 ```
 

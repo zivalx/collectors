@@ -27,6 +27,10 @@ class YouTubeClientConfig(BaseClientConfig):
         default=True,
         description="Try YouTube Transcript API before Whisper fallback"
     )
+    transcript_languages: Optional[List[str]] = Field(
+        default=None,
+        description="Preferred transcript languages in priority order (e.g., ['iw', 'he', 'en'] for Hebrew then English). If None, auto-detects available languages. Note: YouTube uses 'iw', Whisper uses 'he' for Hebrew."
+    )
     compute_type: str = Field(
         default="int8",
         description="Whisper compute type: int8, float16, float32"

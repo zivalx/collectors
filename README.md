@@ -109,6 +109,7 @@ async def main():
     config = YouTubeClientConfig(
         whisper_model="base",
         use_transcript_api=True,  # Try YouTube API first, Whisper fallback
+        transcript_languages=["iw", "he", "en"],  # Hebrew (iw/he) then English (None = auto-detect all)
         max_video_length=3600  # 1 hour max
     )
 
