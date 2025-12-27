@@ -13,6 +13,7 @@ import logging
 
 from connectors.youtube.models import YouTubeClientConfig
 from connectors.youtube.utils import extract_video_id, clean_filename
+from connectors.common.http import with_retry
 from connectors.common.exceptions import DataFetchError
 
 logger = logging.getLogger(__name__)
@@ -48,6 +49,7 @@ class YouTubeClient:
                 logger.error(f"Failed to initialize Whisper model: {e}")
                 self._whisper_model = None
 
+    @with_retry(max_attempts=3)
     async def get_channel_videos(
         self,
         channel_name: str,
@@ -55,6 +57,8 @@ class YouTubeClient:
         days_back: int = 7,
     ) -> List[str]:
         """Get recent video URLs from a channel.
+
+        Retries on transient network errors (3 attempts with exponential backoff).
 
         Extracted from daigest/youtubeService.py lines 115-245.
 
@@ -103,8 +107,11 @@ class YouTubeClient:
         except Exception as e:
             raise DataFetchError(f"Error fetching channel {channel_name}: {e}")
 
+    @with_retry(max_attempts=3)
     async def get_video_metadata(self, url: str) -> Dict[str, Any]:
         """Get video metadata using yt-dlp.
+
+        Retries on transient network errors (3 attempts with exponential backoff).
 
         Extracted from trender/youtube_processor.py lines 109-144.
 

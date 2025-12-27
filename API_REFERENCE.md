@@ -119,7 +119,7 @@ spec = RedditCollectSpec(
     subreddits=["bitcoin", "ethereum"],     # Required: List[str]
     sort="hot",                             # Optional: hot|new|top|rising
     time_filter="day",                      # Optional: hour|day|week|month|year|all
-    max_posts_per_subreddit=50,             # Optional: 1-100 (default: 20)
+    max_posts_per_subreddit=50,             # Optional: any number (default: 20, auto-paginated)
     include_comments=True,                  # Optional: bool (default: True)
     max_comment_depth=None                  # Optional: int|None (default: None)
 )

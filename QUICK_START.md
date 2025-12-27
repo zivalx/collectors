@@ -74,7 +74,7 @@ RedditCollectSpec(
     subreddits: List[str],              # ["python", "learnpython"]
     sort: str = "hot",                  # hot, new, top, rising
     time_filter: str = "day",           # hour, day, week, month, year, all
-    max_posts_per_subreddit: int = 20,  # 1-100
+    max_posts_per_subreddit: int = 20,  # Any number (auto-paginated)
     include_comments: bool = True,      # Collect comments
     skip_stickied: bool = False         # Skip pinned posts
 )

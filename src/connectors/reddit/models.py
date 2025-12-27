@@ -44,8 +44,7 @@ class RedditCollectSpec(BaseCollectSpec):
     max_posts_per_subreddit: int = Field(
         default=20,
         ge=1,
-        le=100,
-        description="Maximum posts to fetch per subreddit"
+        description="Maximum posts to fetch per subreddit (PRAW handles pagination automatically)"
     )
     include_comments: bool = Field(
         default=True,

@@ -7,6 +7,7 @@ import logging
 import httpx
 
 from connectors.gnews.models import GNewsClientConfig
+from connectors.common.http import with_retry
 from connectors.common.exceptions import DataFetchError, AuthenticationError
 
 logger = logging.getLogger(__name__)
@@ -53,6 +54,7 @@ class GNewsClient:
         """Async context manager exit."""
         await self.close()
 
+    @with_retry(max_attempts=3, min_wait=2, max_wait=10)
     async def search(
         self,
         q: str,
@@ -65,6 +67,9 @@ class GNewsClient:
         max_results: int = 10,
     ) -> Dict[str, Any]:
         """Search for news articles.
+
+        Retries on transient network errors (3 attempts, 2-10s exponential backoff).
+        Does NOT retry on auth errors (401/403) or rate limits (429).
 
         Args:
             q: Search query
@@ -80,8 +85,8 @@ class GNewsClient:
             Dict with 'totalArticles' and 'articles' keys
 
         Raises:
-            AuthenticationError: If API key is invalid
-            DataFetchError: If request fails
+            AuthenticationError: If API key is invalid (not retried)
+            DataFetchError: If request fails or rate limited (not retried)
         """
         try:
             client = self._get_client()
