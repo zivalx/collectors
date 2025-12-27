@@ -5,12 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "connectors"
 version = "0.1.0"
-description = "Framework-agnostic data collectors for Reddit, Telegram, YouTube, and Twitter"
+description = "Framework-agnostic data collectors for Reddit, Telegram, YouTube, Twitter, Google Trends, and GNews"
 authors = [{name = "Your Name", email = "your.email@example.com"}]
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
-keywords = ["data-collection", "reddit", "telegram", "youtube", "twitter", "scraping"]
+keywords = ["data-collection", "reddit", "telegram", "youtube", "twitter", "google-trends", "gnews", "news-api", "scraping"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -41,12 +41,21 @@ youtube = [
 twitter = [
     # httpx already in core dependencies
 ]
+pytrends = [
+    "pytrends>=4.9.0",
+    "pandas>=2.0.0",
+]
+gnews = [
+    # httpx already in core dependencies
+]
 all = [
     "asyncpraw>=7.7.0",
     "telethon>=1.34.0",
     "yt-dlp>=2024.12.0",
     "youtube-transcript-api>=0.6.0",
     "faster-whisper>=1.1.0",
+    "pytrends>=4.9.0",
+    "pandas>=2.0.0",
 ]
 dev = [
     "pytest>=7.4.0",

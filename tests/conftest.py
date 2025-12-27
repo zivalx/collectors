@@ -56,6 +56,12 @@ def twitter_bearer_token() -> str:
 
 
 @pytest.fixture
+def gnews_api_key() -> str:
+    """GNews API key from environment."""
+    return get_env_var("GNEWS_API_KEY")
+
+
+@pytest.fixture
 def has_all_credentials() -> bool:
     """Check if all credentials are available."""
     required_vars = [

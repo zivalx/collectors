@@ -1,6 +1,6 @@
 # Connectors
 
-Framework-agnostic data collectors for Reddit, Telegram, YouTube, and Twitter.
+Framework-agnostic data collectors for Reddit, Telegram, YouTube, Twitter, Google Trends (PyTrends), and GNews.
 
 **Use this library to collect social media data from your own applications.** Pass in channels, subreddits, and keywords dynamically - credentials stay separate from collection targets.
 
@@ -20,6 +20,7 @@ Framework-agnostic data collectors for Reddit, Telegram, YouTube, and Twitter.
 See **[API_REFERENCE.md](API_REFERENCE.md)** for complete documentation on using this as a library.
 
 **Quick example:**
+
 ```python
 # Your app dynamically configures collection
 from connectors.reddit import RedditCollector, RedditClientConfig, RedditCollectSpec
@@ -205,6 +206,87 @@ async def main():
 asyncio.run(main())
 ```
 
+### Google Trends (PyTrends)
+
+```python
+import asyncio
+from connectors.pytrends import PyTrendsCollector, PyTrendsClientConfig, PyTrendsCollectSpec
+
+async def main():
+    # Configuration (no API key required)
+    config = PyTrendsClientConfig(
+        timeout=30,
+        retries=3
+    )
+
+    # Collection specification
+    spec = PyTrendsCollectSpec(
+        keywords=["bitcoin", "ethereum"],
+        timeframe="today 3-m",  # Last 3 months
+        geo="US",  # United States (empty for worldwide)
+        include_related_queries=True,
+        include_interest_by_region=False
+    )
+
+    collector = PyTrendsCollector(config)
+    result = await collector.fetch(spec)
+
+    if result.status == "success":
+        # Process trend data
+        for trend in result.interest_over_time:
+            print(f"{trend.date}: {trend.keyword} = {trend.interest}")
+
+        # Show related queries
+        for keyword, queries in result.related_queries_top.items():
+            print(f"\nTop queries for '{keyword}':")
+            for query in queries[:5]:
+                print(f"  - {query.query} ({query.value})")
+    else:
+        print(f"Error: {result.error}")
+
+asyncio.run(main())
+```
+
+### GNews API
+
+```python
+import asyncio
+import os
+from connectors.gnews import GNewsCollector, GNewsClientConfig, GNewsCollectSpec
+
+async def main():
+    # Configuration
+    config = GNewsClientConfig(
+        api_key=os.environ["GNEWS_API_KEY"],  # Get from https://gnews.io
+        timeout=30
+    )
+
+    # Collection specification
+    spec = GNewsCollectSpec(
+        query="bitcoin OR cryptocurrency",  # Boolean operators supported
+        language="en",  # en, es, fr, de, it, pt, ru, zh, ja, ko, ar, hi
+        max_results=10,  # Max 100 per request
+        sort_by="publishedAt"  # publishedAt or relevance
+        # category="technology",  # Optional: technology, business, sports, etc.
+        # country="us",  # Optional: us, gb, ca, au, de, fr, etc.
+    )
+
+    collector = GNewsCollector(config)
+    result = await collector.fetch(spec)
+
+    if result.status == "success":
+        for article in result.articles:
+            print(f"{article.title}")
+            print(f"  Source: {article.source_name}")
+            print(f"  Published: {article.published_at}")
+            print(f"  URL: {article.url}")
+    else:
+        print(f"Error: {result.error}")
+        # Note: GNews free tier allows 100 requests per day
+
+asyncio.run(main())
+```
+
 ## Configuration Pattern
 
 All connectors follow a **two-tier configuration pattern**:
@@ -361,6 +443,7 @@ config = TelegramClientConfig(
 ```
 
 This pattern allows:
+
 - ✅ Automated authentication
 - ✅ Testable code (mock callbacks)
 - ✅ Integration with SMS gateways
@@ -410,15 +493,19 @@ pytest -v
 ## Dependencies
 
 ### Core (always installed)
+
 - `pydantic>=2.4.0` - Data validation
 - `tenacity>=8.0.0` - Retry logic
 - `httpx>=0.24.0` - Async HTTP client
 
 ### Optional (per connector)
+
 - **Reddit**: `asyncpraw>=7.7.0`
 - **Telegram**: `telethon>=1.34.0`
 - **YouTube**: `yt-dlp>=2024.12.0`, `youtube-transcript-api>=0.6.0`, `faster-whisper>=1.1.0`
 - **Twitter**: No additional deps (uses httpx from core)
+- **PyTrends**: `pytrends>=4.9.0`, `pandas>=2.0.0`
+- **GNews**: No additional deps (uses httpx from core)
 
 ## What This Library Does NOT Do
 
@@ -428,9 +515,9 @@ This library focuses on **data collection only**. It does NOT:
 - ❌ Provide web APIs (FastAPI, Flask, etc.)
 - ❌ Read environment variables (you pass credentials)
 - ❌ Normalize data across platforms (raw platform data)
-- ❌ Provide LLM/AI processing
 
 **Your application** handles:
+
 - Database persistence
 - API endpoints
 - Environment variable loading
@@ -442,6 +529,7 @@ This library focuses on **data collection only**. It does NOT:
 ### From Trender
 
 **Before**:
+
 ```python
 from config import config
 from app.services.reddit_collector import RedditDataCollector
@@ -451,6 +539,7 @@ posts = await collector.collect_data()
 ```
 
 **After**:
+
 ```python
 from connectors.reddit import RedditCollector, RedditClientConfig, RedditCollectSpec
 

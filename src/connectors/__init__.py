@@ -1,4 +1,4 @@
-"""Connectors - Framework-agnostic data collectors for Reddit, Telegram, YouTube, and Twitter."""
+"""Connectors - Framework-agnostic data collectors for Reddit, Telegram, YouTube, Twitter, Google Trends, and GNews."""
 
 __version__ = "0.1.0"
 
