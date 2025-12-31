@@ -220,7 +220,11 @@ class YouTubeClient:
 
                 loop = asyncio.get_event_loop()
                 transcript_data, lang_code = await loop.run_in_executor(None, get_transcript)
-                full_text = ' '.join([t['text'] for t in transcript_data])
+                # Handle both dict format and FetchedTranscriptSnippet object format
+                full_text = ' '.join([
+                    t['text'] if isinstance(t, dict) else t.text
+                    for t in transcript_data
+                ])
 
                 logger.info(
                     f"Got transcript from YouTube API for {video_id} "
