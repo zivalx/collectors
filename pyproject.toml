@@ -5,12 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "connectors"
 version = "0.1.0"
-description = "Framework-agnostic data collectors for Reddit, Telegram, YouTube, Twitter, Google Trends, and GNews"
+description = "Framework-agnostic data collectors for Reddit, Telegram, YouTube, Twitter, Google Trends, GNews, and Polymarket"
 authors = [{name = "Your Name", email = "your.email@example.com"}]
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
-keywords = ["data-collection", "reddit", "telegram", "youtube", "twitter", "google-trends", "gnews", "news-api", "scraping"]
+keywords = ["data-collection", "reddit", "telegram", "youtube", "twitter", "google-trends", "gnews", "news-api", "scraping", "polymarket", "prediction-markets"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -46,6 +46,9 @@ pytrends = [
     "pandas>=2.0.0",
 ]
 gnews = [
+    # httpx already in core dependencies
+]
+polymarket = [
     # httpx already in core dependencies
 ]
 all = [
