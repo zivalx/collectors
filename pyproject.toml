@@ -86,6 +86,9 @@ python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 addopts = "-v --cov=src/connectors --cov-report=term-missing"
+markers = [
+    "integration: tests that hit real external APIs (deselect with '-m \"not integration\"')",
+]
 
 [tool.black]
 line-length = 100
