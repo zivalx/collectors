@@ -107,6 +107,10 @@ class YouTubeVideo(BaseModel):
         ...,
         description="Source of transcript: 'youtube_api' or 'whisper'"
     )
+    transcript_segments: Optional[List[dict]] = Field(
+        default=None,
+        description="Per-segment [{start: float (seconds), text: str}], if available"
+    )
     language: Optional[str] = Field(
         default=None,
         description="Detected language code"

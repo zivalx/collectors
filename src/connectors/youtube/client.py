@@ -154,7 +154,7 @@ class YouTubeClient:
         except Exception as e:
             raise DataFetchError(f"Error getting metadata for {url}: {e}")
 
-    async def get_transcript(self, video_id: str) -> Tuple[str, str]:
+    async def get_transcript(self, video_id: str) -> Tuple[str, str, List[dict]]:
         """Get transcript using YouTube Transcript API or Whisper.
 
         Supports multiple languages and auto-detection:
@@ -166,7 +166,9 @@ class YouTubeClient:
             video_id: YouTube video ID
 
         Returns:
-            Tuple of (transcript_text, source) where source is 'youtube_api' or 'whisper'
+            Tuple of (transcript_text, source, segments) where source is
+            'youtube_api' or 'whisper', and segments is a list of
+            {"start": float, "text": str} dicts (may be empty if unavailable)
 
         Raises:
             DataFetchError: If all transcription methods fail
@@ -225,12 +227,19 @@ class YouTubeClient:
                     t['text'] if isinstance(t, dict) else t.text
                     for t in transcript_data
                 ])
+                segments = [
+                    {
+                        "start": float(t['start'] if isinstance(t, dict) else t.start),
+                        "text": t['text'] if isinstance(t, dict) else t.text,
+                    }
+                    for t in transcript_data
+                ]
 
                 logger.info(
                     f"Got transcript from YouTube API for {video_id} "
                     f"(language: {lang_code}, {len(full_text)} chars)"
                 )
-                return (full_text, 'youtube_api')
+                return (full_text, 'youtube_api', segments)
 
             except Exception as e:
                 logger.warning(
@@ -245,7 +254,7 @@ class YouTubeClient:
                 f"No transcription method available for {video_id}"
             )
 
-    async def _transcribe_with_whisper(self, video_id: str) -> Tuple[str, str]:
+    async def _transcribe_with_whisper(self, video_id: str) -> Tuple[str, str, List[dict]]:
         """Download audio and transcribe with Whisper.
 
         Merged from both Trender and Daigest implementations.
@@ -254,7 +263,8 @@ class YouTubeClient:
             video_id: YouTube video ID
 
         Returns:
-            Tuple of (transcript_text, 'whisper')
+            Tuple of (transcript_text, 'whisper', segments) where segments is
+            a list of {"start": float, "text": str} dicts
 
         Raises:
             DataFetchError: If transcription fails
@@ -277,17 +287,22 @@ class YouTubeClient:
                         language=None,  # Auto-detect
                         condition_on_previous_text=False,
                     )
-                    full_text = " ".join([seg.text.strip() for seg in segments])
-                    return full_text, info.language, info.language_probability
+                    segments_list = list(segments)
+                    full_text = " ".join([seg.text.strip() for seg in segments_list])
+                    timed_segments = [
+                        {"start": float(seg.start), "text": seg.text.strip()}
+                        for seg in segments_list
+                    ]
+                    return full_text, info.language, info.language_probability, timed_segments
 
                 loop = asyncio.get_event_loop()
-                text, lang, lang_prob = await loop.run_in_executor(None, transcribe)
+                text, lang, lang_prob, timed_segments = await loop.run_in_executor(None, transcribe)
 
                 logger.info(
                     f"Transcribed {video_id} with Whisper "
                     f"({len(text)} chars, lang={lang})"
                 )
-                return (text, 'whisper')
+                return (text, 'whisper', timed_segments)
 
         except Exception as e:
             raise DataFetchError(f"Whisper transcription failed: {e}")
