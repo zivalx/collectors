@@ -1,5 +1,8 @@
 """Tests for YouTube connector."""
 
+import builtins
+import sys
+
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from youtube_transcript_api._transcripts import FetchedTranscriptSnippet
@@ -10,6 +13,7 @@ from connectors.youtube import (
     YouTubeVideo,
 )
 from connectors.youtube.client import YouTubeClient
+from connectors.common.exceptions import DataFetchError
 
 
 class TestYouTubeClientConfig:
@@ -364,3 +368,65 @@ class TestCollectorPopulatesTranscriptSegments:
         assert video.transcript_source == "youtube_api"
         # New: per-segment timestamps retained for deep-linking
         assert video.transcript_segments == fake_segments
+
+
+class TestFasterWhisperOptional:
+    """faster-whisper is an OPTIONAL extra (pyproject.toml [youtube]/[all]).
+
+    Importing the connector and constructing a client/collector must never
+    require it -- only actually transcribing with Whisper does. These tests
+    simulate faster-whisper being ABSENT (as it genuinely is in this venv;
+    conftest.py only injects a fake module for the *other* tests) and prove
+    nothing raises at import/construction time.
+    """
+
+    @staticmethod
+    def _block_faster_whisper_import(monkeypatch):
+        """Make `from faster_whisper import ...` raise ImportError everywhere,
+        regardless of whether a fake module happens to be sitting in
+        sys.modules (injected by conftest.py for the rest of the suite)."""
+        monkeypatch.delitem(sys.modules, "faster_whisper", raising=False)
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "faster_whisper" or name.startswith("faster_whisper."):
+                raise ImportError("No module named 'faster_whisper'")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", fake_import)
+
+    def test_module_import_succeeds_without_faster_whisper(self, monkeypatch):
+        """connectors.youtube (and .client) must import cleanly with no
+        faster-whisper on the system -- the import must not be top-level."""
+        self._block_faster_whisper_import(monkeypatch)
+
+        import connectors.youtube  # noqa: F401
+        import connectors.youtube.client  # noqa: F401
+
+    def test_client_construction_succeeds_without_faster_whisper(self, monkeypatch):
+        """Constructing YouTubeClient/YouTubeCollector must not raise when
+        faster-whisper is missing; Whisper fallback is disabled instead."""
+        self._block_faster_whisper_import(monkeypatch)
+
+        config = YouTubeClientConfig(whisper_model="base")
+
+        client = YouTubeClient(config)
+        assert client._whisper_model is None
+
+        collector = YouTubeCollector(config)
+        assert collector.client._whisper_model is None
+
+    @pytest.mark.asyncio
+    async def test_whisper_fallback_raises_clean_error_when_unavailable(
+        self, monkeypatch
+    ):
+        """A caption-less video with no Whisper model must fail with a clear
+        DataFetchError, not an AttributeError on None.transcribe(...)."""
+        self._block_faster_whisper_import(monkeypatch)
+
+        config = YouTubeClientConfig(whisper_model="base", use_transcript_api=False)
+        client = YouTubeClient(config)
+        assert client._whisper_model is None
+
+        with pytest.raises(DataFetchError, match="faster-whisper not installed"):
+            await client.get_transcript("dQw4w9WgXcQ")

@@ -3,13 +3,19 @@
 import asyncio
 import os
 import tempfile
-from typing import Optional, Dict, Any, List, Tuple
+from typing import TYPE_CHECKING, Optional, Dict, Any, List, Tuple
 from pathlib import Path
 from datetime import datetime, timedelta
 import yt_dlp
 from youtube_transcript_api import YouTubeTranscriptApi
-from faster_whisper import WhisperModel
 import logging
+
+if TYPE_CHECKING:
+    # faster-whisper is an OPTIONAL extra (see pyproject.toml [youtube]/[all]).
+    # Only import it for type-checking; the real import happens lazily inside
+    # YouTubeClient.__init__ so importing this module never requires the
+    # heavy ML stack (ctranslate2/onnxruntime) to be installed.
+    from faster_whisper import WhisperModel
 
 from connectors.youtube.models import YouTubeClientConfig
 from connectors.youtube.utils import extract_video_id, clean_filename
@@ -34,17 +40,28 @@ class YouTubeClient:
             config: YouTube client configuration
         """
         self.config = config
-        self._whisper_model: Optional[WhisperModel] = None
+        self._whisper_model: "Optional[WhisperModel]" = None
 
-        # Initialize Whisper model lazily
+        # Initialize Whisper model lazily. faster-whisper is an OPTIONAL
+        # extra, so its import happens here (not at module level) and any
+        # failure just disables the Whisper fallback instead of breaking
+        # the whole connector.
         if config.whisper_model:
             try:
+                from faster_whisper import WhisperModel
+
                 self._whisper_model = WhisperModel(
                     config.whisper_model,
                     device="cpu",  # CPU for better compatibility
                     compute_type=config.compute_type,
                 )
                 logger.info(f"Whisper model initialized: {config.whisper_model}")
+            except ImportError as e:
+                logger.warning(
+                    "faster-whisper not installed; Whisper fallback disabled, "
+                    f"transcript-API only ({e})"
+                )
+                self._whisper_model = None
             except Exception as e:
                 logger.error(f"Failed to initialize Whisper model: {e}")
                 self._whisper_model = None
@@ -247,11 +264,13 @@ class YouTubeClient:
                 )
 
         # Fall back to Whisper
-        if self._whisper_model:
+        if self._whisper_model is not None:
             return await self._transcribe_with_whisper(video_id)
         else:
             raise DataFetchError(
-                f"No transcription method available for {video_id}"
+                f"No transcription method available for {video_id}: "
+                "Whisper fallback unavailable (faster-whisper not installed "
+                "or Whisper model not configured)"
             )
 
     async def _transcribe_with_whisper(self, video_id: str) -> Tuple[str, str, List[dict]]:
@@ -269,6 +288,11 @@ class YouTubeClient:
         Raises:
             DataFetchError: If transcription fails
         """
+        if self._whisper_model is None:
+            raise DataFetchError(
+                "Whisper fallback unavailable: faster-whisper not installed"
+            )
+
         try:
             url = f"https://www.youtube.com/watch?v={video_id}"
 
