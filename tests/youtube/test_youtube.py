@@ -13,7 +13,21 @@ from connectors.youtube import (
     YouTubeVideo,
 )
 from connectors.youtube.client import YouTubeClient
+from connectors.youtube.models import published_at_from
 from connectors.common.exceptions import DataFetchError
+
+
+class TestPublishedAtFrom:
+    """Epoch publish timestamp -> ISO-8601 UTC string."""
+
+    def test_published_at_from_epoch(self):
+        assert published_at_from(1786795200) == "2026-08-15T12:00:00Z"
+
+    def test_published_at_from_float_epoch(self):
+        assert published_at_from(1786795200.0) == "2026-08-15T12:00:00Z"
+
+    def test_published_at_from_missing(self):
+        assert published_at_from(None) is None
 
 
 class TestYouTubeClientConfig:
@@ -368,6 +382,41 @@ class TestCollectorPopulatesTranscriptSegments:
         assert video.transcript_source == "youtube_api"
         # New: per-segment timestamps retained for deep-linking
         assert video.transcript_segments == fake_segments
+
+    @pytest.mark.asyncio
+    async def test_process_video_sets_published_at_from_epoch(self):
+        config = YouTubeClientConfig(use_transcript_api=True)
+        collector = YouTubeCollector(config)
+
+        fake_metadata = {
+            "title": "Test Video",
+            "description": "",
+            "duration": 120,
+            "view_count": 0,
+            "like_count": 0,
+            "channel": "Chan",
+            "channel_id": "c1",
+            "upload_date": "20260815",
+            "timestamp": 1786795200,
+            "tags": [],
+            "categories": [],
+            "thumbnail": "",
+        }
+
+        collector.client.get_video_metadata = AsyncMock(return_value=fake_metadata)
+        collector.client.get_transcript = AsyncMock(
+            return_value=("hi there", "youtube_api", [])
+        )
+
+        spec = YouTubeCollectSpec(urls=["https://www.youtube.com/watch?v=dQw4w9WgXcQ"])
+        videos = await collector.fetch(spec)
+
+        assert len(videos) == 1
+        video = videos[0]
+        assert video.status == "success"
+        assert video.published_at == "2026-08-15T12:00:00Z"
+        # Existing date field unchanged
+        assert video.upload_date == "20260815"
 
 
 class TestFasterWhisperOptional:

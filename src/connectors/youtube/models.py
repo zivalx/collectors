@@ -2,8 +2,15 @@
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import List, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 from connectors.common.config import BaseClientConfig, BaseCollectSpec
+
+
+def published_at_from(timestamp: "int | float | None") -> Optional[str]:
+    """Convert an epoch timestamp to an ISO-8601 UTC string (YYYY-MM-DDTHH:MM:SSZ)."""
+    if timestamp is None:
+        return None
+    return datetime.fromtimestamp(timestamp, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 class YouTubeClientConfig(BaseClientConfig):
@@ -86,6 +93,10 @@ class YouTubeVideo(BaseModel):
     upload_date: Optional[str] = Field(
         default=None,
         description="Upload date in YYYYMMDD format"
+    )
+    published_at: Optional[str] = Field(
+        default=None,
+        description="Publish time, ISO-8601 UTC (YYYY-MM-DDTHH:MM:SSZ)"
     )
 
     # Stats

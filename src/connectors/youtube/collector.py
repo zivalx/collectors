@@ -10,6 +10,7 @@ from connectors.youtube.models import (
     YouTubeClientConfig,
     YouTubeCollectSpec,
     YouTubeVideo,
+    published_at_from,
 )
 from connectors.youtube.utils import extract_video_id, validate_youtube_url
 
@@ -187,6 +188,7 @@ class YouTubeCollector:
                 description=metadata['description'],
                 duration=metadata['duration'],
                 upload_date=metadata['upload_date'],
+                published_at=published_at_from(metadata.get('timestamp')),
                 view_count=metadata['view_count'],
                 like_count=metadata['like_count'],
                 channel=metadata['channel'],

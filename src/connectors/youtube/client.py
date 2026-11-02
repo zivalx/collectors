@@ -164,6 +164,7 @@ class YouTubeClient:
                 'channel': info.get('uploader', 'Unknown'),
                 'channel_id': info.get('uploader_id', ''),
                 'upload_date': info.get('upload_date', ''),
+                'timestamp': info.get('timestamp') or info.get('release_timestamp'),
                 'tags': info.get('tags', []) or [],
                 'categories': info.get('categories', []) or [],
                 'thumbnail': info.get('thumbnail', ''),
