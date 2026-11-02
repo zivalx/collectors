@@ -29,6 +29,33 @@ class TestPublishedAtFrom:
     def test_published_at_from_missing(self):
         assert published_at_from(None) is None
 
+    @pytest.mark.parametrize("bad", [10**20, float("nan"), float("inf"), "soon", [1]])
+    def test_published_at_from_unconvertible_returns_none(self, bad):
+        assert published_at_from(bad) is None
+
+
+class TestGetVideoMetadataTimestamp:
+    """get_video_metadata picks the public-availability time for published_at."""
+
+    @staticmethod
+    async def _metadata_for(info):
+        client = YouTubeClient(YouTubeClientConfig())
+        ydl = MagicMock()
+        ydl.__enter__.return_value.extract_info.return_value = info
+        with patch("connectors.youtube.client.yt_dlp.YoutubeDL", return_value=ydl):
+            return await client.get_video_metadata("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+
+    @pytest.mark.asyncio
+    async def test_prefers_release_timestamp_over_timestamp(self):
+        # Premiere: uploaded earlier than it went public.
+        meta = await self._metadata_for({"timestamp": 1786700000, "release_timestamp": 1786795200})
+        assert meta["timestamp"] == 1786795200
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_timestamp(self):
+        meta = await self._metadata_for({"timestamp": 1786795200})
+        assert meta["timestamp"] == 1786795200
+
 
 class TestYouTubeClientConfig:
     """Test YouTube client configuration."""

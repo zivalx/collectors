@@ -10,7 +10,11 @@ def published_at_from(timestamp: "int | float | None") -> Optional[str]:
     """Convert an epoch timestamp to an ISO-8601 UTC string (YYYY-MM-DDTHH:MM:SSZ)."""
     if timestamp is None:
         return None
-    return datetime.fromtimestamp(timestamp, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        return datetime.fromtimestamp(timestamp, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except (OverflowError, OSError, ValueError, TypeError):
+        # Out-of-range / non-numeric value: drop the publish time, keep the video.
+        return None
 
 
 class YouTubeClientConfig(BaseClientConfig):
