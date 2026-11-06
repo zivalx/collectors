@@ -47,6 +47,18 @@ class YouTubeClientConfig(BaseClientConfig):
         description="Whisper compute type: int8, float16, float32"
     )
     timeout: int = Field(default=60, description="Request timeout in seconds")
+    max_concurrency: int = Field(
+        default=4, ge=1,
+        description="Maximum number of videos fetched concurrently"
+    )
+    delay_seconds: float = Field(
+        default=0.0, ge=0,
+        description="Randomized pause before each video fetch (uniform in [0.5x, 1.5x])"
+    )
+    cookies_file: Optional[str] = Field(
+        default=None,
+        description="Path to a Netscape cookies.txt used by yt-dlp and youtube-transcript-api"
+    )
 
 
 class YouTubeCollectSpec(BaseCollectSpec):
@@ -71,6 +83,10 @@ class YouTubeCollectSpec(BaseCollectSpec):
         default=7,
         ge=1,
         description="Only videos from last N days"
+    )
+    skip_video_ids: Optional[List[str]] = Field(
+        default=None,
+        description="Video ids to drop after listing; never fetched"
     )
 
     @model_validator(mode='after')

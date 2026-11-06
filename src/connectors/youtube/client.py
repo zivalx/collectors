@@ -67,6 +67,24 @@ class YouTubeClient:
                 self._whisper_model = None
 
     @with_retry(max_attempts=3)
+    def _apply_cookies(self, ydl_opts: Dict[str, Any]) -> None:
+        """Add the configured cookies file to yt-dlp options."""
+        if self.config.cookies_file:
+            ydl_opts['cookiefile'] = self.config.cookies_file
+
+    def _make_transcript_api(self) -> YouTubeTranscriptApi:
+        """Build the transcript API, with cookies via a requests session if configured."""
+        if not self.config.cookies_file:
+            return YouTubeTranscriptApi()
+        import requests
+        from http.cookiejar import MozillaCookieJar
+
+        jar = MozillaCookieJar(self.config.cookies_file)
+        jar.load(ignore_discard=True, ignore_expires=True)
+        session = requests.Session()
+        session.cookies = jar
+        return YouTubeTranscriptApi(http_client=session)
+
     async def get_channel_videos(
         self,
         channel_name: str,
@@ -100,6 +118,7 @@ class YouTubeClient:
             'extract_flat': True,
             'playlistend': max_videos * 2,  # Fetch more for date filtering
         }
+        self._apply_cookies(ydl_opts)
 
         try:
             def extract_info():
@@ -146,6 +165,7 @@ class YouTubeClient:
             'no_warnings': True,
             'extract_flat': False,
         }
+        self._apply_cookies(ydl_opts)
 
         try:
             def extract_info():
@@ -196,7 +216,7 @@ class YouTubeClient:
         if self.config.use_transcript_api:
             try:
                 def get_transcript():
-                    ytt_api = YouTubeTranscriptApi()
+                    ytt_api = self._make_transcript_api()
                     transcript_list = ytt_api.list(video_id)
 
                     # Strategy 1: Try preferred languages if specified
@@ -358,6 +378,7 @@ class YouTubeClient:
                 'quiet': True,
                 'no_warnings': True,
             }
+            self._apply_cookies(ydl_opts)
 
             def download():
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:

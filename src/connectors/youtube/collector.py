@@ -1,7 +1,9 @@
 """High-level YouTube data collector."""
 
 import asyncio
-from typing import List
+import random
+import re
+from typing import List, Optional
 from datetime import datetime
 import logging
 
@@ -15,6 +17,21 @@ from connectors.youtube.models import (
 from connectors.youtube.utils import extract_video_id, validate_youtube_url
 
 logger = logging.getLogger(__name__)
+
+BLOCK_THRESHOLD = 5
+BLOCK_SKIP_ERROR = "skipped: YouTube block detected"
+_BLOCK_MARKERS = (
+    "sign in to confirm you",
+    "ipblocked",
+    "requestblocked",
+    "too many requests",
+)
+
+
+def _is_block_error(error: Optional[str]) -> bool:
+    """True if an error message looks like a YouTube bot/IP block."""
+    text = (error or "").lower()
+    return any(m in text for m in _BLOCK_MARKERS) or bool(re.search(r"\b429\b", text))
 
 
 class YouTubeCollector:
@@ -79,38 +96,66 @@ class YouTubeCollector:
 
             all_urls.extend(valid_urls)
 
-        # Collect URLs from channels (parallel with gather)
+        # Collect URLs from channels (sequential, with a pause between channels)
         if spec.channels:
             logger.info(f"Fetching from {len(spec.channels)} channels...")
 
-            channel_tasks = [
-                self.client.get_channel_videos(
-                    channel,
-                    spec.max_videos_per_channel,
-                    spec.days_back,
-                )
-                for channel in spec.channels
-            ]
+            for idx, channel in enumerate(spec.channels):
+                if idx > 0:
+                    await self._pause()
+                try:
+                    all_urls.extend(
+                        await self.client.get_channel_videos(
+                            channel,
+                            spec.max_videos_per_channel,
+                            spec.days_back,
+                        )
+                    )
+                except Exception as e:
+                    logger.error(f"Error fetching channel {channel}: {e}")
 
-            channel_results = await asyncio.gather(
-                *channel_tasks, return_exceptions=True
-            )
-
-            for channel, result in zip(spec.channels, channel_results):
-                if isinstance(result, Exception):
-                    logger.error(f"Error fetching channel {channel}: {result}")
-                else:
-                    all_urls.extend(result)
+        if spec.skip_video_ids:
+            skip = set(spec.skip_video_ids)
+            before = len(all_urls)
+            all_urls = [u for u in all_urls if extract_video_id(u) not in skip]
+            logger.info(f"Skipped {before - len(all_urls)} already-collected videos")
 
         if not all_urls:
             logger.warning("No valid URLs to process")
             return []
 
-        logger.info(f"Processing {len(all_urls)} videos in parallel...")
+        logger.info(
+            f"Processing {len(all_urls)} videos "
+            f"(max_concurrency={self.config.max_concurrency})..."
+        )
 
-        # Process all videos in parallel (Daigest pattern)
-        video_tasks = [self._process_video(url) for url in all_urls]
-        results = await asyncio.gather(*video_tasks, return_exceptions=True)
+        semaphore = asyncio.Semaphore(self.config.max_concurrency)
+        state = {"consecutive_blocks": 0, "blocked": False}
+
+        async def run_one(url: str) -> YouTubeVideo:
+            async with semaphore:
+                if state["blocked"]:
+                    return self._failed_video(url, None, BLOCK_SKIP_ERROR)
+                await self._pause()
+                if state["blocked"]:
+                    return self._failed_video(url, None, BLOCK_SKIP_ERROR)
+                result = await self._process_video(url)
+                if result.status == 'failed' and _is_block_error(result.error):
+                    state["consecutive_blocks"] += 1
+                    if state["consecutive_blocks"] >= BLOCK_THRESHOLD:
+                        if not state["blocked"]:
+                            logger.error(
+                                f"{BLOCK_THRESHOLD} consecutive block errors; "
+                                "stopping remaining fetches"
+                            )
+                        state["blocked"] = True
+                else:
+                    state["consecutive_blocks"] = 0
+                return result
+
+        results = await asyncio.gather(
+            *[run_one(u) for u in all_urls], return_exceptions=True
+        )
 
         # Convert any unhandled exceptions to failed video objects
         videos = []
@@ -118,28 +163,8 @@ class YouTubeCollector:
             if isinstance(result, YouTubeVideo):
                 videos.append(result)
             elif isinstance(result, Exception):
-                # Unhandled exception - create failed video object
                 logger.error(f"Unhandled error for {all_urls[i]}: {result}")
-                videos.append(YouTubeVideo(
-                    video_id='unknown',
-                    url=all_urls[i],
-                    title='',
-                    description='',
-                    duration=0,
-                    upload_date=None,
-                    view_count=0,
-                    like_count=0,
-                    channel='',
-                    channel_id='',
-                    tags=[],
-                    categories=[],
-                    thumbnail='',
-                    transcript='',
-                    transcript_source='',
-                    processed_at=datetime.now(),
-                    status='failed',
-                    error=str(result),
-                ))
+                videos.append(self._failed_video(all_urls[i], None, str(result)))
 
         # Log success/failure stats
         successful_count = sum(1 for v in videos if v.status == 'success')
@@ -151,6 +176,35 @@ class YouTubeCollector:
         )
 
         return videos
+
+    async def _pause(self) -> None:
+        """Randomized pause (uniform in [0.5x, 1.5x] of delay_seconds)."""
+        delay = self.config.delay_seconds
+        if delay > 0:
+            await asyncio.sleep(random.uniform(0.5 * delay, 1.5 * delay))
+
+    @staticmethod
+    def _failed_video(url: str, video_id: Optional[str], error: str) -> YouTubeVideo:
+        return YouTubeVideo(
+            video_id=video_id or extract_video_id(url) or 'unknown',
+            url=url,
+            title='',
+            description='',
+            duration=0,
+            upload_date=None,
+            view_count=0,
+            like_count=0,
+            channel='',
+            channel_id='',
+            tags=[],
+            categories=[],
+            thumbnail='',
+            transcript='',
+            transcript_source='',
+            processed_at=datetime.now(),
+            status='failed',
+            error=error,
+        )
 
     async def _process_video(self, url: str) -> YouTubeVideo:
         """Process a single video.
