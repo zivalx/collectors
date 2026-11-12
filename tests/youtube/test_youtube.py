@@ -695,3 +695,15 @@ class TestCaptionBlockHandling:
             with pytest.raises(DataFetchError) as exc:
                 await client.get_transcript("vid1")
         assert _is_block_error(str(exc.value))
+
+
+class TestWhisperLanguage:
+    """The GPU transcriber is told the channel's language instead of guessing."""
+
+    @pytest.mark.parametrize("langs,expected", [
+        (["iw", "he"], "he"), (["en"], "en"), (["en-US"], "en"), ([], None),
+    ])
+    def test_language_from_config(self, langs, expected):
+        client = YouTubeClient(YouTubeClientConfig(
+            transcript_languages=langs, whisper_backend="faster-whisper"))
+        assert client._whisper_language() == expected

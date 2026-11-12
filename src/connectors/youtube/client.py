@@ -440,6 +440,14 @@ class YouTubeClient:
         except Exception as e:
             raise DataFetchError(f"Whisper transcription failed: {e}")
 
+    def _whisper_language(self) -> Optional[str]:
+        """The channel's first configured language as a Whisper code, else auto-detect."""
+        langs = self.config.transcript_languages or []
+        if not langs:
+            return None
+        code = langs[0].split("-")[0].lower()
+        return {"iw": "he"}.get(code, code)
+
     async def _transcribe_mlx(
         self, audio_file: str, video_id: str
     ) -> Tuple[str, str, List[dict]]:
@@ -450,7 +458,7 @@ class YouTubeClient:
             mlx_whisper.transcribe,
             audio_file,
             path_or_hf_repo=self.config.mlx_whisper_model,
-            language=None,  # Auto-detect
+            language=self._whisper_language(),
         )
         timed_segments = []
         for seg in result.get("segments", []):
