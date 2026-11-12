@@ -319,6 +319,12 @@ class TestGetTranscriptSegments:
             {"start": 5.5, "text": "second segment"},
         ]
 
+    @pytest.fixture(autouse=True)
+    def _skip_ffmpeg_decode(self):
+        """The fake audio path is never decoded; the mocked model takes it as-is."""
+        with patch("connectors.youtube.client._decode_audio_ffmpeg", side_effect=lambda path: path):
+            yield
+
     @pytest.mark.asyncio
     async def test_whisper_path_retains_segments(self):
         """Whisper fallback path: segments carry .start / .text."""
@@ -368,6 +374,35 @@ class TestGetTranscriptSegments:
 
         assert source == "whisper"
         assert segments == [{"start": 1.0, "text": "only segment"}]
+
+
+class TestDecodeAudioFfmpeg:
+    """Whisper input is decoded with the ffmpeg binary (PyAV >= 15 breaks faster-whisper)."""
+
+    def test_returns_path_when_ffmpeg_missing(self):
+        from connectors.youtube import client as yt_client
+
+        with patch("shutil.which", return_value=None):
+            assert yt_client._decode_audio_ffmpeg("/tmp/a.m4a") == "/tmp/a.m4a"
+
+    def test_decodes_to_16k_mono_float32(self, tmp_path):
+        import shutil
+        import subprocess
+        import numpy as np
+        from connectors.youtube import client as yt_client
+
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            pytest.skip("ffmpeg not installed")
+        wav = tmp_path / "tone.wav"
+        subprocess.run(
+            [ffmpeg, "-nostdin", "-loglevel", "error", "-f", "lavfi",
+             "-i", "sine=frequency=440:duration=1", "-ac", "2", "-ar", "44100", str(wav)],
+            check=True,
+        )
+        audio = yt_client._decode_audio_ffmpeg(str(wav))
+        assert audio.dtype == np.float32
+        assert abs(len(audio) - yt_client.WHISPER_SAMPLE_RATE) < 200
 
 
 class TestCollectorPopulatesTranscriptSegments:

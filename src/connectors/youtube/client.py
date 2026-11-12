@@ -24,6 +24,32 @@ from connectors.common.exceptions import DataFetchError
 
 logger = logging.getLogger(__name__)
 
+WHISPER_SAMPLE_RATE = 16000
+
+
+def _decode_audio_ffmpeg(audio_file: str):
+    """Decode an audio file to 16 kHz mono float32 for faster-whisper.
+
+    faster-whisper's own decoder (PyAV) breaks on PyAV >= 15 ("open() got an
+    unexpected keyword argument 'metadata_errors'"), so decode with the ffmpeg
+    binary instead. Falls back to the file path when ffmpeg is not installed.
+    """
+    import shutil
+    import subprocess
+
+    import numpy as np
+
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return audio_file
+    proc = subprocess.run(
+        [ffmpeg, "-nostdin", "-loglevel", "error", "-i", audio_file,
+         "-f", "f32le", "-ac", "1", "-ar", str(WHISPER_SAMPLE_RATE), "-"],
+        capture_output=True,
+        check=True,
+    )
+    return np.frombuffer(proc.stdout, dtype=np.float32)
+
 
 class YouTubeClient:
     """Low-level YouTube client combining Trender + Daigest architectures.
@@ -328,7 +354,7 @@ class YouTubeClient:
                 # Transcribe
                 def transcribe():
                     segments, info = self._whisper_model.transcribe(
-                        audio_file,
+                        _decode_audio_ffmpeg(audio_file),
                         beam_size=5,
                         language=None,  # Auto-detect
                         condition_on_previous_text=False,

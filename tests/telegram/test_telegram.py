@@ -201,3 +201,27 @@ class TestTelegramCollector:
         # Check we got messages from channels
         channels = {msg.channel for msg in messages}
         assert len(channels) >= 1  # At least one channel returned data
+
+
+class TestTelegramMessageLink:
+    """message_link is the public t.me URL extraction cites; private ids get none."""
+
+    def test_username_forms(self):
+        from connectors.telegram.models import telegram_message_link
+        assert telegram_message_link("noammadar", 5) == "https://t.me/noammadar/5"
+        assert telegram_message_link("@NoamMadar", 5) == "https://t.me/NoamMadar/5"
+        assert telegram_message_link("https://t.me/noammadar/", 5) == "https://t.me/noammadar/5"
+
+    def test_numeric_id_has_no_link(self):
+        from connectors.telegram.models import telegram_message_link
+        assert telegram_message_link("-1001234567890", 5) is None
+        assert telegram_message_link("", 5) is None
+
+
+class TestTelegramApiIdTypes:
+    """api_id arrives as str from env vars or as int from callers; accept both."""
+
+    def test_int_and_str_api_id(self):
+        from connectors.telegram.models import TelegramClientConfig
+        assert TelegramClientConfig(api_id=123, api_hash="h").api_id == 123
+        assert TelegramClientConfig(api_id="123", api_hash="h").api_id == "123"
