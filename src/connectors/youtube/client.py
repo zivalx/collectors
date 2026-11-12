@@ -1,12 +1,13 @@
 """Low-level YouTube client - MERGED from Trender + Daigest."""
 
 import asyncio
+import json
 import os
 import platform
 import tempfile
 from typing import TYPE_CHECKING, Optional, Dict, Any, List, Tuple
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import yt_dlp
 from youtube_transcript_api import YouTubeTranscriptApi
 import logging
@@ -253,7 +254,65 @@ class YouTubeClient:
         except Exception as e:
             raise DataFetchError(f"Error getting metadata for {url}: {e}")
 
+    def _cache_path(self, video_id: str) -> Optional[Path]:
+        if not self.config.transcript_cache_dir:
+            return None
+        return Path(self.config.transcript_cache_dir).expanduser() / f"{video_id}.json"
+
+    def _read_cached_transcript(self, video_id: str) -> Optional[Tuple[str, str, List[dict]]]:
+        path = self._cache_path(video_id)
+        if path is None or not path.is_file():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            text = data.get("transcript") or ""
+            if not text.strip():
+                return None
+            return (text, data.get("source") or "cache", data.get("segments") or [])
+        except (OSError, ValueError) as e:
+            logger.warning(f"Ignoring unreadable cached transcript {path}: {e}")
+            return None
+
+    def _write_cached_transcript(
+        self, video_id: str, text: str, source: str, segments: List[dict]
+    ) -> None:
+        path = self._cache_path(video_id)
+        if path is None or not text.strip():
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps({
+                "video_id": video_id,
+                "source": source,
+                "whisper_model": (
+                    self.config.mlx_whisper_model if self._whisper_backend == "mlx"
+                    else self.config.whisper_model
+                ) if source == "whisper" else None,
+                "saved_at": datetime.now(timezone.utc).isoformat(),
+                "transcript": text,
+                "segments": segments,
+            }, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, path)
+        except OSError as e:
+            logger.warning(f"Could not save transcript for {video_id} to {path}: {e}")
+
     async def get_transcript(self, video_id: str) -> Tuple[str, str, List[dict]]:
+        """Transcript for a video, using the on-disk cache when configured.
+
+        A cached transcript (``transcript_cache_dir``) is returned without any
+        network call; a freshly fetched one is saved there immediately, so long
+        runs never lose finished work.
+        """
+        cached = self._read_cached_transcript(video_id)
+        if cached is not None:
+            logger.info(f"Using cached transcript for {video_id}")
+            return cached
+        text, source, segments = await self._fetch_transcript(video_id)
+        self._write_cached_transcript(video_id, text, source, segments)
+        return text, source, segments
+
+    async def _fetch_transcript(self, video_id: str) -> Tuple[str, str, List[dict]]:
         """Get transcript using YouTube Transcript API or Whisper.
 
         Supports multiple languages and auto-detection:

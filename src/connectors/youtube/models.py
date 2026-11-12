@@ -34,6 +34,13 @@ class YouTubeClientConfig(BaseClientConfig):
         default="mlx-community/whisper-large-v3-turbo",
         description="MLX Whisper model repo or path (used by the mlx backend)"
     )
+    transcript_cache_dir: Optional[str] = Field(
+        default=None,
+        description=(
+            "Directory where each transcript is saved as <video_id>.json the moment "
+            "it is fetched, and reused on later runs instead of fetching again"
+        ),
+    )
     max_video_length: int = Field(
         default=3600,
         description="Maximum video length in seconds (1 hour default)"

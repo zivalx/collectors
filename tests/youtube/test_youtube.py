@@ -707,3 +707,53 @@ class TestWhisperLanguage:
         client = YouTubeClient(YouTubeClientConfig(
             transcript_languages=langs, whisper_backend="faster-whisper"))
         assert client._whisper_language() == expected
+
+
+class TestTranscriptCache:
+    """Each transcript is saved to disk as soon as it is fetched and reused later."""
+
+    @pytest.mark.asyncio
+    async def test_fetched_transcript_is_saved_and_reused(self, tmp_path):
+        import json as _json
+
+        client = YouTubeClient(YouTubeClientConfig(
+            transcript_cache_dir=str(tmp_path), whisper_backend="faster-whisper"))
+        fetch = AsyncMock(return_value=("hello world", "whisper", [{"start": 0.0, "text": "hello world"}]))
+        with patch.object(client, "_fetch_transcript", new=fetch):
+            first = await client.get_transcript("vid1")
+            second = await client.get_transcript("vid1")
+
+        assert first == second == ("hello world", "whisper", [{"start": 0.0, "text": "hello world"}])
+        assert fetch.await_count == 1  # second call came from disk
+        saved = _json.loads((tmp_path / "vid1.json").read_text(encoding="utf-8"))
+        assert saved["video_id"] == "vid1" and saved["transcript"] == "hello world"
+        assert saved["source"] == "whisper" and saved["segments"][0]["start"] == 0.0
+
+    @pytest.mark.asyncio
+    async def test_failed_fetch_saves_nothing(self, tmp_path):
+        client = YouTubeClient(YouTubeClientConfig(
+            transcript_cache_dir=str(tmp_path), whisper_backend="faster-whisper"))
+        with patch.object(client, "_fetch_transcript",
+                          new=AsyncMock(side_effect=DataFetchError("boom"))):
+            with pytest.raises(DataFetchError):
+                await client.get_transcript("vid2")
+        assert not list(tmp_path.iterdir())
+
+    @pytest.mark.asyncio
+    async def test_unreadable_cache_file_is_ignored(self, tmp_path):
+        (tmp_path / "vid3.json").write_text("{not json", encoding="utf-8")
+        client = YouTubeClient(YouTubeClientConfig(
+            transcript_cache_dir=str(tmp_path), whisper_backend="faster-whisper"))
+        fetch = AsyncMock(return_value=("fresh", "youtube_api", []))
+        with patch.object(client, "_fetch_transcript", new=fetch):
+            assert (await client.get_transcript("vid3"))[0] == "fresh"
+        assert fetch.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_no_cache_dir_means_no_files(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        client = YouTubeClient(YouTubeClientConfig(whisper_backend="faster-whisper"))
+        with patch.object(client, "_fetch_transcript",
+                          new=AsyncMock(return_value=("t", "youtube_api", []))):
+            await client.get_transcript("vid4")
+        assert not list(tmp_path.iterdir())
