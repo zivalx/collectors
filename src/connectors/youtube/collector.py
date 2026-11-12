@@ -14,24 +14,13 @@ from connectors.youtube.models import (
     YouTubeVideo,
     published_at_from,
 )
-from connectors.youtube.utils import extract_video_id, validate_youtube_url
+from connectors.youtube.utils import extract_video_id, validate_youtube_url, is_block_error
 
 logger = logging.getLogger(__name__)
 
 BLOCK_THRESHOLD = 5
 BLOCK_SKIP_ERROR = "skipped: YouTube block detected"
-_BLOCK_MARKERS = (
-    "sign in to confirm you",
-    "ipblocked",
-    "requestblocked",
-    "too many requests",
-)
-
-
-def _is_block_error(error: Optional[str]) -> bool:
-    """True if an error message looks like a YouTube bot/IP block."""
-    text = (error or "").lower()
-    return any(m in text for m in _BLOCK_MARKERS) or bool(re.search(r"\b429\b", text))
+_is_block_error = is_block_error
 
 
 class YouTubeCollector:

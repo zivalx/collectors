@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import platform
 import tempfile
 from typing import TYPE_CHECKING, Optional, Dict, Any, List, Tuple
 from pathlib import Path
@@ -18,7 +19,7 @@ if TYPE_CHECKING:
     from faster_whisper import WhisperModel
 
 from connectors.youtube.models import YouTubeClientConfig
-from connectors.youtube.utils import extract_video_id, clean_filename
+from connectors.youtube.utils import extract_video_id, clean_filename, is_block_error
 from connectors.common.http import with_retry
 from connectors.common.exceptions import DataFetchError
 
@@ -51,6 +52,34 @@ def _decode_audio_ffmpeg(audio_file: str):
     return np.frombuffer(proc.stdout, dtype=np.float32)
 
 
+def _resolve_whisper_backend(config: YouTubeClientConfig) -> Optional[str]:
+    """Pick the Whisper backend: "mlx", "faster-whisper", or None (disabled).
+
+    Whisper is disabled when ``config.whisper_model`` is empty (``--no-whisper``).
+    "auto" picks mlx on Apple Silicon when mlx_whisper is importable. An
+    explicit "mlx" that is not importable falls back to faster-whisper.
+    """
+    if not config.whisper_model:
+        return None
+    backend = config.whisper_backend
+    if backend == "faster-whisper":
+        return "faster-whisper"
+    if backend == "auto" and not (
+        platform.system() == "Darwin" and platform.machine() == "arm64"
+    ):
+        return "faster-whisper"
+    try:
+        import mlx_whisper  # noqa: F401
+    except ImportError:
+        if backend == "mlx":
+            logger.warning(
+                "mlx-whisper requested but not importable; "
+                "falling back to faster-whisper"
+            )
+        return "faster-whisper"
+    return "mlx"
+
+
 class YouTubeClient:
     """Low-level YouTube client combining Trender + Daigest architectures.
 
@@ -67,12 +96,17 @@ class YouTubeClient:
         """
         self.config = config
         self._whisper_model: "Optional[WhisperModel]" = None
+        self._captions_blocked = False
+        self._captions_block_logged = False
+        self._whisper_backend = _resolve_whisper_backend(config)
 
         # Initialize Whisper model lazily. faster-whisper is an OPTIONAL
         # extra, so its import happens here (not at module level) and any
         # failure just disables the Whisper fallback instead of breaking
         # the whole connector.
-        if config.whisper_model:
+        if self._whisper_backend == "mlx":
+            logger.info(f"Whisper backend: mlx ({config.mlx_whisper_model})")
+        elif self._whisper_backend == "faster-whisper":
             try:
                 from faster_whisper import WhisperModel
 
@@ -238,8 +272,16 @@ class YouTubeClient:
         Raises:
             DataFetchError: If all transcription methods fail
         """
-        # Try YouTube Transcript API first (if enabled)
-        if self.config.use_transcript_api:
+        api_error: Optional[BaseException] = None
+        if self._captions_blocked and not self._captions_block_logged:
+            self._captions_block_logged = True
+            logger.warning(
+                "YouTube captions are blocked; skipping transcript API and "
+                "using Whisper for remaining videos"
+            )
+
+        # Try YouTube Transcript API first (if enabled and not blocked)
+        if self.config.use_transcript_api and not self._captions_blocked:
             try:
                 def get_transcript():
                     ytt_api = self._make_transcript_api()
@@ -307,19 +349,35 @@ class YouTubeClient:
                 return (full_text, 'youtube_api', segments)
 
             except Exception as e:
+                api_error = e
                 logger.warning(
                     f"YouTube Transcript API failed for {video_id}: {e}"
                 )
+                if is_block_error(e):
+                    self._captions_blocked = True
 
         # Fall back to Whisper
-        if self._whisper_model is not None:
-            return await self._transcribe_with_whisper(video_id)
-        else:
-            raise DataFetchError(
-                f"No transcription method available for {video_id}: "
-                "Whisper fallback unavailable (faster-whisper not installed "
-                "or Whisper model not configured)"
-            )
+        if self._whisper_available():
+            try:
+                return await self._transcribe_with_whisper(video_id)
+            except DataFetchError as whisper_error:
+                if api_error is not None and is_block_error(api_error):
+                    raise DataFetchError(
+                        f"Transcript API failed: {api_error}; "
+                        f"Whisper failed: {whisper_error}"
+                    )
+                raise
+        msg = (
+            f"No transcription method available for {video_id}: "
+            "Whisper fallback unavailable (faster-whisper not installed "
+            "or Whisper model not configured)"
+        )
+        if api_error is not None and is_block_error(api_error):
+            msg = f"Transcript API failed: {api_error}; Whisper failed: {msg}"
+        raise DataFetchError(msg)
+
+    def _whisper_available(self) -> bool:
+        return self._whisper_backend == "mlx" or self._whisper_model is not None
 
     async def _transcribe_with_whisper(self, video_id: str) -> Tuple[str, str, List[dict]]:
         """Download audio and transcribe with Whisper.
@@ -336,7 +394,7 @@ class YouTubeClient:
         Raises:
             DataFetchError: If transcription fails
         """
-        if self._whisper_model is None:
+        if not self._whisper_available():
             raise DataFetchError(
                 "Whisper fallback unavailable: faster-whisper not installed"
             )
@@ -350,6 +408,9 @@ class YouTubeClient:
                 audio_file = await self._download_audio(url, video_id, temp_dir)
                 if not audio_file:
                     raise DataFetchError("Failed to download audio")
+
+                if self._whisper_backend == "mlx":
+                    return await self._transcribe_mlx(audio_file, video_id)
 
                 # Transcribe
                 def transcribe():
@@ -378,6 +439,30 @@ class YouTubeClient:
 
         except Exception as e:
             raise DataFetchError(f"Whisper transcription failed: {e}")
+
+    async def _transcribe_mlx(
+        self, audio_file: str, video_id: str
+    ) -> Tuple[str, str, List[dict]]:
+        """Transcribe an audio file with mlx-whisper (Apple GPU)."""
+        import mlx_whisper
+
+        result = await asyncio.to_thread(
+            mlx_whisper.transcribe,
+            audio_file,
+            path_or_hf_repo=self.config.mlx_whisper_model,
+            language=None,  # Auto-detect
+        )
+        timed_segments = []
+        for seg in result.get("segments", []):
+            text = seg["text"].strip()
+            if text:
+                timed_segments.append({"start": float(seg["start"]), "text": text})
+        full_text = " ".join(s["text"] for s in timed_segments)
+        logger.info(
+            f"Transcribed {video_id} with Whisper backend=mlx "
+            f"({len(full_text)} chars, lang={result.get('language')})"
+        )
+        return (full_text, 'whisper', timed_segments)
 
     async def _download_audio(
         self, url: str, video_id: str, output_dir: str

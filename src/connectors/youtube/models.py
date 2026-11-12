@@ -1,7 +1,7 @@
 """Pydantic models for YouTube connector."""
 
 from pydantic import BaseModel, Field, field_validator, model_validator
-from typing import List, Optional
+from typing import List, Literal, Optional
 from datetime import datetime, timezone
 from connectors.common.config import BaseClientConfig, BaseCollectSpec
 
@@ -25,6 +25,14 @@ class YouTubeClientConfig(BaseClientConfig):
     whisper_model: str = Field(
         default="base",
         description="Whisper model: tiny, base, small, medium, large"
+    )
+    whisper_backend: Literal["auto", "mlx", "faster-whisper"] = Field(
+        default="auto",
+        description="Whisper backend: auto (mlx on Apple Silicon if installed, else faster-whisper), mlx, or faster-whisper"
+    )
+    mlx_whisper_model: str = Field(
+        default="mlx-community/whisper-large-v3-turbo",
+        description="MLX Whisper model repo or path (used by the mlx backend)"
     )
     max_video_length: int = Field(
         default=3600,

@@ -328,7 +328,7 @@ class TestGetTranscriptSegments:
     @pytest.mark.asyncio
     async def test_whisper_path_retains_segments(self):
         """Whisper fallback path: segments carry .start / .text."""
-        config = YouTubeClientConfig(use_transcript_api=False)
+        config = YouTubeClientConfig(use_transcript_api=False, whisper_backend="faster-whisper")
         client = YouTubeClient(config)
 
         fake_segments = [
@@ -358,7 +358,7 @@ class TestGetTranscriptSegments:
     @pytest.mark.asyncio
     async def test_whisper_path_used_when_api_disabled(self):
         """When use_transcript_api is False, Whisper is used directly (no API call)."""
-        config = YouTubeClientConfig(use_transcript_api=False)
+        config = YouTubeClientConfig(use_transcript_api=False, whisper_backend="faster-whisper")
         client = YouTubeClient(config)
 
         client._whisper_model = MagicMock()
@@ -519,7 +519,7 @@ class TestFasterWhisperOptional:
         faster-whisper is missing; Whisper fallback is disabled instead."""
         self._block_faster_whisper_import(monkeypatch)
 
-        config = YouTubeClientConfig(whisper_model="base")
+        config = YouTubeClientConfig(whisper_model="base", whisper_backend="faster-whisper")
 
         client = YouTubeClient(config)
         assert client._whisper_model is None
@@ -535,9 +535,163 @@ class TestFasterWhisperOptional:
         DataFetchError, not an AttributeError on None.transcribe(...)."""
         self._block_faster_whisper_import(monkeypatch)
 
-        config = YouTubeClientConfig(whisper_model="base", use_transcript_api=False)
+        config = YouTubeClientConfig(whisper_model="base", use_transcript_api=False, whisper_backend="faster-whisper")
         client = YouTubeClient(config)
         assert client._whisper_model is None
 
         with pytest.raises(DataFetchError, match="faster-whisper not installed"):
             await client.get_transcript("dQw4w9WgXcQ")
+
+
+class TestWhisperBackendResolution:
+    """_resolve_whisper_backend picks mlx / faster-whisper / disabled."""
+
+    @staticmethod
+    def _resolve(config, system, machine, mlx_importable):
+        from connectors.youtube.client import _resolve_whisper_backend
+
+        fake_mlx = MagicMock() if mlx_importable else None
+        # A None entry in sys.modules makes `import mlx_whisper` raise ImportError
+        with patch("connectors.youtube.client.platform.system", return_value=system), \
+             patch("connectors.youtube.client.platform.machine", return_value=machine), \
+             patch.dict(sys.modules, {"mlx_whisper": fake_mlx}):
+            return _resolve_whisper_backend(config)
+
+    def test_auto_picks_mlx_on_apple_silicon(self):
+        assert self._resolve(YouTubeClientConfig(), "Darwin", "arm64", True) == "mlx"
+
+    def test_auto_picks_faster_whisper_on_linux(self):
+        assert self._resolve(YouTubeClientConfig(), "Linux", "x86_64", True) == "faster-whisper"
+
+    def test_auto_falls_back_when_mlx_not_importable(self):
+        assert self._resolve(YouTubeClientConfig(), "Darwin", "arm64", False) == "faster-whisper"
+
+    def test_explicit_mlx_not_importable_falls_back(self):
+        cfg = YouTubeClientConfig(whisper_backend="mlx")
+        assert self._resolve(cfg, "Linux", "x86_64", False) == "faster-whisper"
+
+    def test_explicit_faster_whisper_ignores_mlx(self):
+        cfg = YouTubeClientConfig(whisper_backend="faster-whisper")
+        assert self._resolve(cfg, "Darwin", "arm64", True) == "faster-whisper"
+
+    @pytest.mark.parametrize("backend", ["auto", "mlx", "faster-whisper"])
+    def test_empty_whisper_model_disables_whisper(self, backend):
+        cfg = YouTubeClientConfig(whisper_model="", whisper_backend=backend)
+        assert self._resolve(cfg, "Darwin", "arm64", True) is None
+        client = YouTubeClient(cfg)
+        assert client._whisper_backend is None
+        assert client._whisper_model is None
+
+    def test_mlx_backend_does_not_load_faster_whisper(self):
+        with patch("connectors.youtube.client._resolve_whisper_backend", return_value="mlx"):
+            client = YouTubeClient(YouTubeClientConfig())
+        assert client._whisper_model is None
+        assert client._whisper_available()
+
+
+class TestMlxWhisperTranscription:
+    @pytest.mark.asyncio
+    async def test_mlx_path_returns_text_and_segments(self):
+        with patch("connectors.youtube.client._resolve_whisper_backend", return_value="mlx"):
+            client = YouTubeClient(YouTubeClientConfig(use_transcript_api=False))
+        fake_mlx = MagicMock()
+        fake_mlx.transcribe.return_value = {
+            "language": "en",
+            "segments": [
+                {"start": 0, "text": " Hello world "},
+                {"start": 2.5, "text": "   "},
+                {"start": 5.0, "text": " second "},
+            ],
+        }
+        with patch.dict(sys.modules, {"mlx_whisper": fake_mlx}), \
+             patch.object(client, "_download_audio", AsyncMock(return_value="/tmp/x.m4a")):
+            text, source, segments = await client.get_transcript("abc123")
+
+        assert source == "whisper"
+        assert text == "Hello world second"
+        assert segments == [
+            {"start": 0.0, "text": "Hello world"},
+            {"start": 5.0, "text": "second"},
+        ]
+        fake_mlx.transcribe.assert_called_once_with(
+            "/tmp/x.m4a",
+            path_or_hf_repo="mlx-community/whisper-large-v3-turbo",
+            language=None,
+        )
+
+
+class TestCaptionBlockHandling:
+    BLOCK_MSG = "IpBlocked: YouTube is blocking requests from your IP"
+
+    @staticmethod
+    def _client(whisper_ok=True):
+        cfg = YouTubeClientConfig(use_transcript_api=True, whisper_backend="faster-whisper")
+        client = YouTubeClient(cfg)
+        client._whisper_backend = "faster-whisper"
+        client._whisper_model = MagicMock()
+        return client
+
+    def test_is_block_error_markers(self):
+        from connectors.youtube.utils import is_block_error
+        from connectors.youtube.collector import _is_block_error
+
+        for msg in ["IpBlocked", "RequestBlocked", "Too Many Requests", "HTTP 429", "Sign in to confirm you're not a bot"]:
+            assert is_block_error(msg) and _is_block_error(msg)
+        assert not is_block_error("HTTP 4290 nope")
+        assert not is_block_error(None)
+
+    @pytest.mark.asyncio
+    async def test_block_error_skips_caption_api_for_next_video(self):
+        client = self._client()
+        api = MagicMock()
+        api.list.side_effect = Exception(self.BLOCK_MSG)
+        whisper = AsyncMock(return_value=("t", "whisper", []))
+        with patch("connectors.youtube.client.YouTubeTranscriptApi", return_value=api), \
+             patch.object(client, "_transcribe_with_whisper", whisper):
+            await client.get_transcript("vid1")
+            assert client._captions_blocked is True
+            await client.get_transcript("vid2")
+
+        assert api.list.call_count == 1
+        assert whisper.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_non_block_error_does_not_set_flag(self):
+        client = self._client()
+        api = MagicMock()
+        api.list.side_effect = Exception("No transcripts available for this video")
+        with patch("connectors.youtube.client.YouTubeTranscriptApi", return_value=api), \
+             patch.object(client, "_transcribe_with_whisper", AsyncMock(return_value=("t", "whisper", []))):
+            await client.get_transcript("vid1")
+            await client.get_transcript("vid2")
+        assert client._captions_blocked is False
+        assert api.list.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_caption_block_plus_whisper_failure_reports_both(self):
+        from connectors.youtube.collector import _is_block_error
+
+        client = self._client()
+        api = MagicMock()
+        api.list.side_effect = Exception(self.BLOCK_MSG)
+        whisper = AsyncMock(side_effect=DataFetchError("Whisper transcription failed: boom"))
+        with patch("connectors.youtube.client.YouTubeTranscriptApi", return_value=api), \
+             patch.object(client, "_transcribe_with_whisper", whisper):
+            with pytest.raises(DataFetchError) as exc:
+                await client.get_transcript("vid1")
+
+        msg = str(exc.value)
+        assert "IpBlocked" in msg and "boom" in msg
+        assert _is_block_error(msg)
+
+    @pytest.mark.asyncio
+    async def test_caption_block_with_whisper_unavailable_reports_block(self):
+        from connectors.youtube.collector import _is_block_error
+
+        client = YouTubeClient(YouTubeClientConfig(whisper_model="", use_transcript_api=True))
+        api = MagicMock()
+        api.list.side_effect = Exception(self.BLOCK_MSG)
+        with patch("connectors.youtube.client.YouTubeTranscriptApi", return_value=api):
+            with pytest.raises(DataFetchError) as exc:
+                await client.get_transcript("vid1")
+        assert _is_block_error(str(exc.value))
