@@ -757,3 +757,64 @@ class TestTranscriptCache:
                           new=AsyncMock(return_value=("t", "youtube_api", []))):
             await client.get_transcript("vid4")
         assert not list(tmp_path.iterdir())
+
+
+class TestChannelDateCutoff:
+    """Channel videos older than days_back are skipped before download, and a
+    channel stops being fetched once its (newest-first) listing passes the cutoff."""
+
+    @staticmethod
+    def _meta(day: str) -> dict:
+        return {
+            "title": day, "description": "", "duration": 60, "view_count": 0,
+            "like_count": 0, "channel": "Chan", "channel_id": "c1",
+            "upload_date": day, "tags": [], "categories": [], "thumbnail": "",
+        }
+
+    @staticmethod
+    def _url(n: int) -> str:
+        return f"https://www.youtube.com/watch?v=vid{n:08d}"
+
+    def _collector(self, days: list):
+        from datetime import datetime, timedelta, timezone
+        collector = YouTubeCollector(YouTubeClientConfig(delay_seconds=0))
+        today = datetime.now(timezone.utc)
+        dates = {self._url(i): (today - timedelta(days=d)).strftime("%Y%m%d")
+                 for i, d in enumerate(days)}
+        collector.client.get_channel_videos = AsyncMock(return_value=list(dates))
+        collector.client.get_video_metadata = AsyncMock(
+            side_effect=lambda url: self._meta(dates[url]))
+        collector.client.get_transcript = AsyncMock(return_value=("text", "whisper", []))
+        return collector
+
+    @pytest.mark.asyncio
+    async def test_old_channel_videos_skipped_and_channel_stops(self):
+        # newest first: 2 in window, then 4 older than 30 days
+        collector = self._collector([1, 10, 40, 50, 60, 70])
+        videos = await collector.fetch(
+            YouTubeCollectSpec(channels=["@chan"], max_videos_per_channel=10, days_back=30))
+
+        assert [v.video_id for v in videos] == ["vid00000000", "vid00000001"]
+        assert all(v.status == "success" for v in videos)
+        assert collector.client.get_transcript.await_count == 2
+        # stops after CUTOFF_STREAK (3) consecutive old videos: 6th never fetched
+        assert collector.client.get_video_metadata.await_count == 5
+
+    @pytest.mark.asyncio
+    async def test_single_old_video_does_not_stop_channel(self):
+        collector = self._collector([1, 40, 2, 3])
+        videos = await collector.fetch(
+            YouTubeCollectSpec(channels=["@chan"], max_videos_per_channel=10, days_back=30))
+
+        assert [v.video_id for v in videos] == ["vid00000000", "vid00000002", "vid00000003"]
+
+    @pytest.mark.asyncio
+    async def test_direct_urls_not_date_filtered(self):
+        collector = YouTubeCollector(YouTubeClientConfig(delay_seconds=0))
+        collector.client.get_video_metadata = AsyncMock(return_value=self._meta("20100101"))
+        collector.client.get_transcript = AsyncMock(return_value=("text", "whisper", []))
+
+        videos = await collector.fetch(
+            YouTubeCollectSpec(urls=["https://www.youtube.com/watch?v=dQw4w9WgXcQ"], days_back=7))
+
+        assert len(videos) == 1 and videos[0].status == "success"

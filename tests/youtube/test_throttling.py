@@ -99,7 +99,7 @@ async def test_skip_video_ids_prevents_fetches():
     col = make_collector()
     col.client.get_channel_videos = AsyncMock(return_value=URLS[:4])
     videos = await col.fetch(
-        YouTubeCollectSpec(channels=["@a"], skip_video_ids=[IDS[0], IDS[2]])
+        YouTubeCollectSpec(channels=["@a"], skip_video_ids=[IDS[0], IDS[2]], days_back=3650)
     )
     assert [v.video_id for v in videos] == [IDS[1], IDS[3]]
     fetched = [c.args[0] for c in col.client.get_video_metadata.call_args_list]

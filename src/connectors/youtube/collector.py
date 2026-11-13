@@ -3,8 +3,8 @@
 import asyncio
 import random
 import re
-from typing import List, Optional
-from datetime import datetime
+from typing import Any, Dict, List, Optional
+from datetime import datetime, timedelta, timezone
 import logging
 
 from connectors.youtube.client import YouTubeClient
@@ -20,6 +20,9 @@ logger = logging.getLogger(__name__)
 
 BLOCK_THRESHOLD = 5
 BLOCK_SKIP_ERROR = "skipped: YouTube block detected"
+# A channel listing is newest first; after this many consecutive videos older than
+# days_back, the rest of that channel is not fetched at all.
+CUTOFF_STREAK = 3
 _is_block_error = is_block_error
 
 
@@ -74,6 +77,9 @@ class YouTubeCollector:
             ```
         """
         all_urls = []
+        # Channel-listed URLs are limited to the last days_back days; direct URLs are not.
+        channel_of: Dict[str, str] = {}
+        cutoff = datetime.now(timezone.utc) - timedelta(days=spec.days_back)
 
         # Collect URLs from direct list
         if spec.urls:
@@ -93,13 +99,14 @@ class YouTubeCollector:
                 if idx > 0:
                     await self._pause()
                 try:
-                    all_urls.extend(
-                        await self.client.get_channel_videos(
-                            channel,
-                            spec.max_videos_per_channel,
-                            spec.days_back,
-                        )
+                    urls = await self.client.get_channel_videos(
+                        channel,
+                        spec.max_videos_per_channel,
+                        spec.days_back,
                     )
+                    all_urls.extend(urls)
+                    for u in urls:
+                        channel_of.setdefault(u, channel)
                 except Exception as e:
                     logger.error(f"Error fetching channel {channel}: {e}")
 
@@ -119,16 +126,35 @@ class YouTubeCollector:
         )
 
         semaphore = asyncio.Semaphore(self.config.max_concurrency)
-        state = {"consecutive_blocks": 0, "blocked": False}
+        state: Dict[str, Any] = {"consecutive_blocks": 0, "blocked": False}
+        old_streak: Dict[str, int] = {}
 
-        async def run_one(url: str) -> YouTubeVideo:
+        def past_cutoff(url: str) -> bool:
+            channel = channel_of.get(url)
+            return channel is not None and old_streak.get(channel, 0) >= CUTOFF_STREAK
+
+        async def run_one(url: str) -> Optional[YouTubeVideo]:
             async with semaphore:
+                if past_cutoff(url):
+                    return None
                 if state["blocked"]:
                     return self._failed_video(url, None, BLOCK_SKIP_ERROR)
                 await self._pause()
+                if past_cutoff(url):
+                    return None
                 if state["blocked"]:
                     return self._failed_video(url, None, BLOCK_SKIP_ERROR)
-                result = await self._process_video(url)
+                channel = channel_of.get(url)
+                result = await self._process_video(url, cutoff if channel else None)
+                if channel is not None:
+                    old_streak[channel] = old_streak.get(channel, 0) + 1 if result is None else 0
+                    if old_streak[channel] == CUTOFF_STREAK:
+                        logger.info(
+                            f"Channel {channel}: reached videos older than "
+                            f"{spec.days_back} days; skipping the rest"
+                        )
+                if result is None:
+                    return None
                 if result.status == 'failed' and _is_block_error(result.error):
                     state["consecutive_blocks"] += 1
                     if state["consecutive_blocks"] >= BLOCK_THRESHOLD:
@@ -149,6 +175,8 @@ class YouTubeCollector:
         # Convert any unhandled exceptions to failed video objects
         videos = []
         for i, result in enumerate(results):
+            if result is None:
+                continue  # older than days_back: out of scope, not a failure
             if isinstance(result, YouTubeVideo):
                 videos.append(result)
             elif isinstance(result, Exception):
@@ -160,7 +188,7 @@ class YouTubeCollector:
         failed_count = len(videos) - successful_count
 
         logger.info(
-            f"Processed {len(all_urls)} videos: "
+            f"Processed {len(videos)} videos: "
             f"{successful_count} successful, {failed_count} failed"
         )
 
@@ -195,14 +223,32 @@ class YouTubeCollector:
             error=error,
         )
 
-    async def _process_video(self, url: str) -> YouTubeVideo:
+    @staticmethod
+    def _video_time(metadata: Dict[str, Any]) -> Optional[datetime]:
+        """Publish time from metadata (epoch timestamp, else YYYYMMDD upload_date)."""
+        ts = metadata.get('timestamp')
+        if ts:
+            try:
+                return datetime.fromtimestamp(float(ts), tz=timezone.utc)
+            except (TypeError, ValueError, OverflowError, OSError):
+                pass
+        day = metadata.get('upload_date') or ''
+        try:
+            return datetime.strptime(str(day), '%Y%m%d').replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+
+    async def _process_video(
+        self, url: str, cutoff: Optional[datetime] = None
+    ) -> Optional[YouTubeVideo]:
         """Process a single video.
 
         Args:
             url: YouTube video URL
 
         Returns:
-            YouTubeVideo object (status may be 'failed')
+            YouTubeVideo object (status may be 'failed'), or None when the video
+            was published before ``cutoff`` (out of scope, nothing downloaded)
         """
         video_id = None
         try:
@@ -212,6 +258,13 @@ class YouTubeCollector:
 
             # Get metadata
             metadata = await self.client.get_video_metadata(url)
+
+            # Out of the time window: no download, no transcription
+            if cutoff is not None:
+                published = self._video_time(metadata)
+                if published is not None and published < cutoff:
+                    logger.info(f"Skipping {url}: published {published:%Y-%m-%d}, before cutoff")
+                    return None
 
             # Check duration limit
             if metadata['duration'] > self.config.max_video_length:
