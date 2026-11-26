@@ -1,7 +1,8 @@
 """YouTube utility functions."""
 
 import re
-from typing import Optional
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Optional
 
 _BLOCK_MARKERS = (
     "sign in to confirm you",
@@ -101,3 +102,26 @@ def clean_filename(filename: str) -> str:
         filename = filename[:200]
 
     return filename
+
+
+def video_published_at(info: Dict[str, Any]) -> Optional[datetime]:
+    """Best-known publish time of a yt-dlp info/metadata dict, as aware UTC.
+
+    Prefers an epoch ``release_timestamp`` / ``timestamp``. When only the
+    date-only ``upload_date`` (YYYYMMDD) exists, returns the END of that UTC day,
+    so a cutoff check never drops a video that may still be inside the window.
+    Returns None when no usable date is present.
+    """
+    for key in ('release_timestamp', 'timestamp'):
+        ts = info.get(key)
+        if ts:
+            try:
+                return datetime.fromtimestamp(float(ts), tz=timezone.utc)
+            except (TypeError, ValueError, OverflowError, OSError):
+                pass
+    day = info.get('upload_date') or ''
+    try:
+        start = datetime.strptime(str(day), '%Y%m%d').replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    return start + timedelta(days=1) - timedelta(seconds=1)

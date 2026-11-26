@@ -97,7 +97,11 @@ class YouTubeCollectSpec(BaseCollectSpec):
     days_back: int = Field(
         default=7,
         ge=1,
-        description="Only videos from last N days"
+        description="Only videos from last N days (channel-listed videos only; direct URLs are never date-filtered)"
+    )
+    include_undated: bool = Field(
+        default=False,
+        description="Keep channel-listed videos whose publish date cannot be determined (default: skip and count them)"
     )
     skip_video_ids: Optional[List[str]] = Field(
         default=None,
