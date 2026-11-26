@@ -177,7 +177,7 @@ class YouTubeCollector:
                 )
 
             # Get transcript (YouTube API → Whisper fallback)
-            transcript, source = await self.client.get_transcript(video_id)
+            transcript, source, segments = await self.client.get_transcript(video_id)
 
             # Build successful result
             return YouTubeVideo(
@@ -196,6 +196,7 @@ class YouTubeCollector:
                 thumbnail=metadata['thumbnail'],
                 transcript=transcript,
                 transcript_source=source,
+                transcript_segments=segments,
                 processed_at=datetime.now(),
                 status='success',
             )
