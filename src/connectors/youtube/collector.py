@@ -14,14 +14,20 @@ from connectors.youtube.models import (
     YouTubeVideo,
     published_at_from,
 )
-from connectors.youtube.utils import extract_video_id, validate_youtube_url, is_block_error
+from connectors.youtube.utils import (
+    extract_video_id,
+    validate_youtube_url,
+    is_block_error,
+    video_published_at,
+)
 
 logger = logging.getLogger(__name__)
 
 BLOCK_THRESHOLD = 5
 BLOCK_SKIP_ERROR = "skipped: YouTube block detected"
-# A channel listing is newest first; after this many consecutive videos older than
-# days_back, the rest of that channel is not fetched at all.
+# A channel listing is newest first; after this many consecutive videos that are
+# dated and older than days_back, the rest of that channel is not fetched at all.
+# Undated videos never count towards the streak.
 CUTOFF_STREAK = 3
 _is_block_error = is_block_error
 
@@ -41,6 +47,13 @@ class YouTubeCollector:
         """
         self.config = config
         self.client = YouTubeClient(config)
+        self._old_urls: set = set()
+        # Counts from the most recent fetch(): channel-listed videos not processed
+        # because they fell outside days_back or had no publish date.
+        self.last_run_stats: Dict[str, int] = {
+            "skipped_out_of_window": 0,
+            "skipped_undated": 0,
+        }
 
     async def fetch(self, spec: YouTubeCollectSpec) -> List[YouTubeVideo]:
         """Fetch YouTube videos according to specification.
@@ -77,8 +90,11 @@ class YouTubeCollector:
             ```
         """
         all_urls = []
+        self.last_run_stats = {"skipped_out_of_window": 0, "skipped_undated": 0}
         # Channel-listed URLs are limited to the last days_back days; direct URLs are not.
         channel_of: Dict[str, str] = {}
+        channel_urls = set()
+        self._old_urls = set()
         cutoff = datetime.now(timezone.utc) - timedelta(days=spec.days_back)
 
         # Collect URLs from direct list
@@ -106,6 +122,7 @@ class YouTubeCollector:
                     )
                     all_urls.extend(urls)
                     for u in urls:
+                        channel_urls.add(u)
                         channel_of.setdefault(u, channel)
                 except Exception as e:
                     logger.error(f"Error fetching channel {channel}: {e}")
@@ -115,6 +132,9 @@ class YouTubeCollector:
             before = len(all_urls)
             all_urls = [u for u in all_urls if extract_video_id(u) not in skip]
             logger.info(f"Skipped {before - len(all_urls)} already-collected videos")
+
+        # A URL passed explicitly is never date-filtered, even if also listed
+        channel_urls.difference_update(spec.urls or [])
 
         if not all_urls:
             logger.warning("No valid URLs to process")
@@ -130,7 +150,7 @@ class YouTubeCollector:
         old_streak: Dict[str, int] = {}
 
         def past_cutoff(url: str) -> bool:
-            channel = channel_of.get(url)
+            channel = channel_of.get(url) if url in channel_urls else None
             return channel is not None and old_streak.get(channel, 0) >= CUTOFF_STREAK
 
         async def run_one(url: str) -> Optional[YouTubeVideo]:
@@ -144,15 +164,22 @@ class YouTubeCollector:
                     return None
                 if state["blocked"]:
                     return self._failed_video(url, None, BLOCK_SKIP_ERROR)
-                channel = channel_of.get(url)
-                result = await self._process_video(url, cutoff if channel else None)
-                if channel is not None:
-                    old_streak[channel] = old_streak.get(channel, 0) + 1 if result is None else 0
-                    if old_streak[channel] == CUTOFF_STREAK:
-                        logger.info(
-                            f"Channel {channel}: reached videos older than "
-                            f"{spec.days_back} days; skipping the rest"
-                        )
+                result = await self._process_video(
+                    url,
+                    cutoff=cutoff if url in channel_urls else None,
+                    include_undated=spec.include_undated,
+                )
+                if url in channel_urls:
+                    channel = channel_of.get(url)
+                    if url in self._old_urls:
+                        old_streak[channel] = old_streak.get(channel, 0) + 1
+                        if old_streak[channel] == CUTOFF_STREAK:
+                            logger.info(
+                                f"Channel {channel}: reached videos older than "
+                                f"{spec.days_back} days; skipping the rest"
+                            )
+                    else:
+                        old_streak[channel] = 0
                 if result is None:
                     return None
                 if result.status == 'failed' and _is_block_error(result.error):
@@ -176,7 +203,7 @@ class YouTubeCollector:
         videos = []
         for i, result in enumerate(results):
             if result is None:
-                continue  # older than days_back: out of scope, not a failure
+                continue  # outside days_back / undated: counted in last_run_stats
             if isinstance(result, YouTubeVideo):
                 videos.append(result)
             elif isinstance(result, Exception):
@@ -189,7 +216,9 @@ class YouTubeCollector:
 
         logger.info(
             f"Processed {len(videos)} videos: "
-            f"{successful_count} successful, {failed_count} failed"
+            f"{successful_count} successful, {failed_count} failed "
+            f"(skipped: {self.last_run_stats['skipped_out_of_window']} older than "
+            f"{spec.days_back} days, {self.last_run_stats['skipped_undated']} undated)"
         )
 
         return videos
@@ -223,23 +252,11 @@ class YouTubeCollector:
             error=error,
         )
 
-    @staticmethod
-    def _video_time(metadata: Dict[str, Any]) -> Optional[datetime]:
-        """Publish time from metadata (epoch timestamp, else YYYYMMDD upload_date)."""
-        ts = metadata.get('timestamp')
-        if ts:
-            try:
-                return datetime.fromtimestamp(float(ts), tz=timezone.utc)
-            except (TypeError, ValueError, OverflowError, OSError):
-                pass
-        day = metadata.get('upload_date') or ''
-        try:
-            return datetime.strptime(str(day), '%Y%m%d').replace(tzinfo=timezone.utc)
-        except ValueError:
-            return None
-
     async def _process_video(
-        self, url: str, cutoff: Optional[datetime] = None
+        self,
+        url: str,
+        cutoff: Optional[datetime] = None,
+        include_undated: bool = False,
     ) -> Optional[YouTubeVideo]:
         """Process a single video.
 
@@ -248,7 +265,8 @@ class YouTubeCollector:
 
         Returns:
             YouTubeVideo object (status may be 'failed'), or None when the video
-            was published before ``cutoff`` (out of scope, nothing downloaded)
+            was skipped because of ``cutoff`` (older, or undated and not
+            ``include_undated``); nothing is downloaded for skipped videos
         """
         video_id = None
         try:
@@ -259,10 +277,17 @@ class YouTubeCollector:
             # Get metadata
             metadata = await self.client.get_video_metadata(url)
 
-            # Out of the time window: no download, no transcription
+            # Look-back window: decided on metadata alone, before captions/audio
             if cutoff is not None:
-                published = self._video_time(metadata)
-                if published is not None and published < cutoff:
+                published = video_published_at(metadata)
+                if published is None:
+                    if not include_undated:
+                        self.last_run_stats["skipped_undated"] += 1
+                        logger.info(f"Skipping {url}: no publish date")
+                        return None
+                elif published < cutoff:
+                    self.last_run_stats["skipped_out_of_window"] += 1
+                    self._old_urls.add(url)
                     logger.info(f"Skipping {url}: published {published:%Y-%m-%d}, before cutoff")
                     return None
 

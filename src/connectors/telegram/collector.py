@@ -1,7 +1,7 @@
 """High-level Telegram data collector."""
 
 from typing import List
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import logging
 
 from connectors.telegram.client import TelegramClient
@@ -67,6 +67,11 @@ class TelegramCollector:
             ```
         """
         all_messages = []
+        since = (
+            datetime.now(timezone.utc) - timedelta(days=spec.days_back)
+            if spec.days_back
+            else None
+        )
 
         async with TelegramClient(self.config) as client:
             for channel in spec.channels:
@@ -78,6 +83,7 @@ class TelegramCollector:
                         channel=channel,
                         limit=spec.max_messages_per_channel,
                         include_replies=spec.include_replies,
+                        since=since,
                     )
 
                     # Process messages into typed models (lines 85-113)

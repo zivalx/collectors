@@ -2,7 +2,8 @@
 
 from telethon import TelegramClient as TelethonClient
 from telethon.errors import SessionPasswordNeededError
-from typing import List
+from datetime import datetime, timezone
+from typing import List, Optional
 import logging
 
 from connectors.telegram.models import TelegramClientConfig
@@ -79,7 +80,11 @@ class TelegramClient:
         logger.info("Telegram client disconnected")
 
     async def fetch_messages(
-        self, channel: str, limit: int = 200, include_replies: bool = True
+        self,
+        channel: str,
+        limit: int = 200,
+        include_replies: bool = True,
+        since: Optional[datetime] = None,
     ) -> List:
         """Fetch messages from a channel with optional replies.
 
@@ -89,6 +94,9 @@ class TelegramClient:
             channel: Channel username or ID
             limit: Maximum messages to fetch
             include_replies: Whether to fetch replies for each message
+            since: If given, only messages dated at or after this time (naive
+                values are taken as UTC). Messages are read newest first and
+                reading stops at the first older one; ``limit`` stays an upper bound.
 
         Returns:
             List of Telethon Message objects with replies attached
@@ -101,7 +109,21 @@ class TelegramClient:
             channel_entity = await self._client.get_entity(channel)
 
             # Fetch messages
-            messages = await self._client.get_messages(channel_entity, limit=limit)
+            if since is None:
+                messages = await self._client.get_messages(channel_entity, limit=limit)
+            else:
+                if since.tzinfo is None:
+                    since = since.replace(tzinfo=timezone.utc)
+                messages = []
+                async for message in self._client.iter_messages(
+                    channel_entity, limit=limit
+                ):
+                    sent = message.date
+                    if sent is not None and sent.tzinfo is None:
+                        sent = sent.replace(tzinfo=timezone.utc)
+                    if sent is not None and sent < since:
+                        break
+                    messages.append(message)
 
             # Fetch replies if requested (lines 62-78)
             if include_replies:

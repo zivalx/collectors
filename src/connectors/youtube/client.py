@@ -20,7 +20,7 @@ if TYPE_CHECKING:
     from faster_whisper import WhisperModel
 
 from connectors.youtube.models import YouTubeClientConfig
-from connectors.youtube.utils import extract_video_id, clean_filename, is_block_error
+from connectors.youtube.utils import extract_video_id, clean_filename, is_block_error, video_published_at
 from connectors.common.http import with_retry
 from connectors.common.exceptions import DataFetchError
 
@@ -171,30 +171,39 @@ class YouTubeClient:
         """
         normalized_name = channel_name.lstrip('@')
         url = f"https://www.youtube.com/@{normalized_name}/videos"
-        cutoff_date = datetime.now() - timedelta(days=days_back)
+        cutoff_date = datetime.now(timezone.utc) - timedelta(days=days_back)
 
         ydl_opts = {
             'quiet': True,
             'no_warnings': True,
             'extract_flat': True,
-            'playlistend': max_videos * 2,  # Fetch more for date filtering
+            # Lazy listing: pages are fetched only as entries are consumed, so we
+            # can stop as soon as we have enough or reach videos older than cutoff.
+            'lazy_playlist': True,
         }
         self._apply_cookies(ydl_opts)
 
         try:
-            def extract_info():
+            def list_videos() -> List[str]:
+                urls: List[str] = []
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    return ydl.extract_info(url, download=False)
+                    info = ydl.extract_info(url, download=False)
+                    for entry in info.get('entries') or []:
+                        if len(urls) >= max_videos:
+                            break
+                        if not entry or not entry.get('id'):
+                            continue
+                        # Uploads are newest first: the first dated entry older than
+                        # the cutoff ends the window. Undated entries are kept here
+                        # and judged on full metadata by the collector.
+                        published = video_published_at(entry)
+                        if published is not None and published < cutoff_date:
+                            break
+                        urls.append(f"https://www.youtube.com/watch?v={entry['id']}")
+                return urls
 
             loop = asyncio.get_event_loop()
-            info = await loop.run_in_executor(None, extract_info)
-
-            # Extract video URLs
-            video_urls = []
-            for entry in info.get('entries', [])[:max_videos]:
-                if entry and entry.get('id'):
-                    video_url = f"https://www.youtube.com/watch?v={entry['id']}"
-                    video_urls.append(video_url)
+            video_urls = await loop.run_in_executor(None, list_videos)
 
             logger.info(
                 f"Found {len(video_urls)} videos from channel @{normalized_name}"

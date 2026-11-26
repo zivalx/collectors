@@ -58,6 +58,12 @@ class TelegramCollectSpec(BaseCollectSpec):
         default=True,
         description="Whether to fetch replies to messages"
     )
+    days_back: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description="Only messages from the last N days (None = no date limit; "
+        "max_messages_per_channel still applies as an upper bound)"
+    )
 
 
 class TelegramReply(BaseModel):
