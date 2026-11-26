@@ -1,11 +1,13 @@
 """Low-level YouTube client - MERGED from Trender + Daigest."""
 
 import asyncio
+import json
 import os
+import platform
 import tempfile
 from typing import TYPE_CHECKING, Optional, Dict, Any, List, Tuple
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import yt_dlp
 from youtube_transcript_api import YouTubeTranscriptApi
 import logging
@@ -18,11 +20,65 @@ if TYPE_CHECKING:
     from faster_whisper import WhisperModel
 
 from connectors.youtube.models import YouTubeClientConfig
-from connectors.youtube.utils import extract_video_id, clean_filename
+from connectors.youtube.utils import extract_video_id, clean_filename, is_block_error
 from connectors.common.http import with_retry
 from connectors.common.exceptions import DataFetchError
 
 logger = logging.getLogger(__name__)
+
+WHISPER_SAMPLE_RATE = 16000
+
+
+def _decode_audio_ffmpeg(audio_file: str):
+    """Decode an audio file to 16 kHz mono float32 for faster-whisper.
+
+    faster-whisper's own decoder (PyAV) breaks on PyAV >= 15 ("open() got an
+    unexpected keyword argument 'metadata_errors'"), so decode with the ffmpeg
+    binary instead. Falls back to the file path when ffmpeg is not installed.
+    """
+    import shutil
+    import subprocess
+
+    import numpy as np
+
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return audio_file
+    proc = subprocess.run(
+        [ffmpeg, "-nostdin", "-loglevel", "error", "-i", audio_file,
+         "-f", "f32le", "-ac", "1", "-ar", str(WHISPER_SAMPLE_RATE), "-"],
+        capture_output=True,
+        check=True,
+    )
+    return np.frombuffer(proc.stdout, dtype=np.float32)
+
+
+def _resolve_whisper_backend(config: YouTubeClientConfig) -> Optional[str]:
+    """Pick the Whisper backend: "mlx", "faster-whisper", or None (disabled).
+
+    Whisper is disabled when ``config.whisper_model`` is empty (``--no-whisper``).
+    "auto" picks mlx on Apple Silicon when mlx_whisper is importable. An
+    explicit "mlx" that is not importable falls back to faster-whisper.
+    """
+    if not config.whisper_model:
+        return None
+    backend = config.whisper_backend
+    if backend == "faster-whisper":
+        return "faster-whisper"
+    if backend == "auto" and not (
+        platform.system() == "Darwin" and platform.machine() == "arm64"
+    ):
+        return "faster-whisper"
+    try:
+        import mlx_whisper  # noqa: F401
+    except ImportError:
+        if backend == "mlx":
+            logger.warning(
+                "mlx-whisper requested but not importable; "
+                "falling back to faster-whisper"
+            )
+        return "faster-whisper"
+    return "mlx"
 
 
 class YouTubeClient:
@@ -41,12 +97,17 @@ class YouTubeClient:
         """
         self.config = config
         self._whisper_model: "Optional[WhisperModel]" = None
+        self._captions_blocked = False
+        self._captions_block_logged = False
+        self._whisper_backend = _resolve_whisper_backend(config)
 
         # Initialize Whisper model lazily. faster-whisper is an OPTIONAL
         # extra, so its import happens here (not at module level) and any
         # failure just disables the Whisper fallback instead of breaking
         # the whole connector.
-        if config.whisper_model:
+        if self._whisper_backend == "mlx":
+            logger.info(f"Whisper backend: mlx ({config.mlx_whisper_model})")
+        elif self._whisper_backend == "faster-whisper":
             try:
                 from faster_whisper import WhisperModel
 
@@ -67,6 +128,24 @@ class YouTubeClient:
                 self._whisper_model = None
 
     @with_retry(max_attempts=3)
+    def _apply_cookies(self, ydl_opts: Dict[str, Any]) -> None:
+        """Add the configured cookies file to yt-dlp options."""
+        if self.config.cookies_file:
+            ydl_opts['cookiefile'] = self.config.cookies_file
+
+    def _make_transcript_api(self) -> YouTubeTranscriptApi:
+        """Build the transcript API, with cookies via a requests session if configured."""
+        if not self.config.cookies_file:
+            return YouTubeTranscriptApi()
+        import requests
+        from http.cookiejar import MozillaCookieJar
+
+        jar = MozillaCookieJar(self.config.cookies_file)
+        jar.load(ignore_discard=True, ignore_expires=True)
+        session = requests.Session()
+        session.cookies = jar
+        return YouTubeTranscriptApi(http_client=session)
+
     async def get_channel_videos(
         self,
         channel_name: str,
@@ -100,6 +179,7 @@ class YouTubeClient:
             'extract_flat': True,
             'playlistend': max_videos * 2,  # Fetch more for date filtering
         }
+        self._apply_cookies(ydl_opts)
 
         try:
             def extract_info():
@@ -146,6 +226,7 @@ class YouTubeClient:
             'no_warnings': True,
             'extract_flat': False,
         }
+        self._apply_cookies(ydl_opts)
 
         try:
             def extract_info():
@@ -164,6 +245,8 @@ class YouTubeClient:
                 'channel': info.get('uploader', 'Unknown'),
                 'channel_id': info.get('uploader_id', ''),
                 'upload_date': info.get('upload_date', ''),
+                # Premieres/scheduled streams: upload time can precede public availability.
+                'timestamp': info.get('release_timestamp') or info.get('timestamp'),
                 'tags': info.get('tags', []) or [],
                 'categories': info.get('categories', []) or [],
                 'thumbnail': info.get('thumbnail', ''),
@@ -171,7 +254,65 @@ class YouTubeClient:
         except Exception as e:
             raise DataFetchError(f"Error getting metadata for {url}: {e}")
 
+    def _cache_path(self, video_id: str) -> Optional[Path]:
+        if not self.config.transcript_cache_dir:
+            return None
+        return Path(self.config.transcript_cache_dir).expanduser() / f"{video_id}.json"
+
+    def _read_cached_transcript(self, video_id: str) -> Optional[Tuple[str, str, List[dict]]]:
+        path = self._cache_path(video_id)
+        if path is None or not path.is_file():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            text = data.get("transcript") or ""
+            if not text.strip():
+                return None
+            return (text, data.get("source") or "cache", data.get("segments") or [])
+        except (OSError, ValueError) as e:
+            logger.warning(f"Ignoring unreadable cached transcript {path}: {e}")
+            return None
+
+    def _write_cached_transcript(
+        self, video_id: str, text: str, source: str, segments: List[dict]
+    ) -> None:
+        path = self._cache_path(video_id)
+        if path is None or not text.strip():
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps({
+                "video_id": video_id,
+                "source": source,
+                "whisper_model": (
+                    self.config.mlx_whisper_model if self._whisper_backend == "mlx"
+                    else self.config.whisper_model
+                ) if source == "whisper" else None,
+                "saved_at": datetime.now(timezone.utc).isoformat(),
+                "transcript": text,
+                "segments": segments,
+            }, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, path)
+        except OSError as e:
+            logger.warning(f"Could not save transcript for {video_id} to {path}: {e}")
+
     async def get_transcript(self, video_id: str) -> Tuple[str, str, List[dict]]:
+        """Transcript for a video, using the on-disk cache when configured.
+
+        A cached transcript (``transcript_cache_dir``) is returned without any
+        network call; a freshly fetched one is saved there immediately, so long
+        runs never lose finished work.
+        """
+        cached = self._read_cached_transcript(video_id)
+        if cached is not None:
+            logger.info(f"Using cached transcript for {video_id}")
+            return cached
+        text, source, segments = await self._fetch_transcript(video_id)
+        self._write_cached_transcript(video_id, text, source, segments)
+        return text, source, segments
+
+    async def _fetch_transcript(self, video_id: str) -> Tuple[str, str, List[dict]]:
         """Get transcript using YouTube Transcript API or Whisper.
 
         Supports multiple languages and auto-detection:
@@ -190,11 +331,19 @@ class YouTubeClient:
         Raises:
             DataFetchError: If all transcription methods fail
         """
-        # Try YouTube Transcript API first (if enabled)
-        if self.config.use_transcript_api:
+        api_error: Optional[BaseException] = None
+        if self._captions_blocked and not self._captions_block_logged:
+            self._captions_block_logged = True
+            logger.warning(
+                "YouTube captions are blocked; skipping transcript API and "
+                "using Whisper for remaining videos"
+            )
+
+        # Try YouTube Transcript API first (if enabled and not blocked)
+        if self.config.use_transcript_api and not self._captions_blocked:
             try:
                 def get_transcript():
-                    ytt_api = YouTubeTranscriptApi()
+                    ytt_api = self._make_transcript_api()
                     transcript_list = ytt_api.list(video_id)
 
                     # Strategy 1: Try preferred languages if specified
@@ -259,19 +408,35 @@ class YouTubeClient:
                 return (full_text, 'youtube_api', segments)
 
             except Exception as e:
+                api_error = e
                 logger.warning(
                     f"YouTube Transcript API failed for {video_id}: {e}"
                 )
+                if is_block_error(e):
+                    self._captions_blocked = True
 
         # Fall back to Whisper
-        if self._whisper_model is not None:
-            return await self._transcribe_with_whisper(video_id)
-        else:
-            raise DataFetchError(
-                f"No transcription method available for {video_id}: "
-                "Whisper fallback unavailable (faster-whisper not installed "
-                "or Whisper model not configured)"
-            )
+        if self._whisper_available():
+            try:
+                return await self._transcribe_with_whisper(video_id)
+            except DataFetchError as whisper_error:
+                if api_error is not None and is_block_error(api_error):
+                    raise DataFetchError(
+                        f"Transcript API failed: {api_error}; "
+                        f"Whisper failed: {whisper_error}"
+                    )
+                raise
+        msg = (
+            f"No transcription method available for {video_id}: "
+            "Whisper fallback unavailable (faster-whisper not installed "
+            "or Whisper model not configured)"
+        )
+        if api_error is not None and is_block_error(api_error):
+            msg = f"Transcript API failed: {api_error}; Whisper failed: {msg}"
+        raise DataFetchError(msg)
+
+    def _whisper_available(self) -> bool:
+        return self._whisper_backend == "mlx" or self._whisper_model is not None
 
     async def _transcribe_with_whisper(self, video_id: str) -> Tuple[str, str, List[dict]]:
         """Download audio and transcribe with Whisper.
@@ -288,7 +453,7 @@ class YouTubeClient:
         Raises:
             DataFetchError: If transcription fails
         """
-        if self._whisper_model is None:
+        if not self._whisper_available():
             raise DataFetchError(
                 "Whisper fallback unavailable: faster-whisper not installed"
             )
@@ -303,10 +468,13 @@ class YouTubeClient:
                 if not audio_file:
                     raise DataFetchError("Failed to download audio")
 
+                if self._whisper_backend == "mlx":
+                    return await self._transcribe_mlx(audio_file, video_id)
+
                 # Transcribe
                 def transcribe():
                     segments, info = self._whisper_model.transcribe(
-                        audio_file,
+                        _decode_audio_ffmpeg(audio_file),
                         beam_size=5,
                         language=None,  # Auto-detect
                         condition_on_previous_text=False,
@@ -330,6 +498,38 @@ class YouTubeClient:
 
         except Exception as e:
             raise DataFetchError(f"Whisper transcription failed: {e}")
+
+    def _whisper_language(self) -> Optional[str]:
+        """The channel's first configured language as a Whisper code, else auto-detect."""
+        langs = self.config.transcript_languages or []
+        if not langs:
+            return None
+        code = langs[0].split("-")[0].lower()
+        return {"iw": "he"}.get(code, code)
+
+    async def _transcribe_mlx(
+        self, audio_file: str, video_id: str
+    ) -> Tuple[str, str, List[dict]]:
+        """Transcribe an audio file with mlx-whisper (Apple GPU)."""
+        import mlx_whisper
+
+        result = await asyncio.to_thread(
+            mlx_whisper.transcribe,
+            audio_file,
+            path_or_hf_repo=self.config.mlx_whisper_model,
+            language=self._whisper_language(),
+        )
+        timed_segments = []
+        for seg in result.get("segments", []):
+            text = seg["text"].strip()
+            if text:
+                timed_segments.append({"start": float(seg["start"]), "text": text})
+        full_text = " ".join(s["text"] for s in timed_segments)
+        logger.info(
+            f"Transcribed {video_id} with Whisper backend=mlx "
+            f"({len(full_text)} chars, lang={result.get('language')})"
+        )
+        return (full_text, 'whisper', timed_segments)
 
     async def _download_audio(
         self, url: str, video_id: str, output_dir: str
@@ -356,6 +556,7 @@ class YouTubeClient:
                 'quiet': True,
                 'no_warnings': True,
             }
+            self._apply_cookies(ydl_opts)
 
             def download():
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:

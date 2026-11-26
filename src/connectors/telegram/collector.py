@@ -10,6 +10,7 @@ from connectors.telegram.models import (
     TelegramCollectSpec,
     TelegramMessage,
     TelegramReply,
+    telegram_message_link,
 )
 
 logger = logging.getLogger(__name__)
@@ -102,6 +103,7 @@ class TelegramCollector:
                                 text=msg.text,
                                 author=msg.sender_id,
                                 replies=replies,
+                                message_link=telegram_message_link(channel, msg.id),
                             )
                             all_messages.append(message)
 

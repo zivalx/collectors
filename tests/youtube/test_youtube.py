@@ -13,7 +13,48 @@ from connectors.youtube import (
     YouTubeVideo,
 )
 from connectors.youtube.client import YouTubeClient
+from connectors.youtube.models import published_at_from
 from connectors.common.exceptions import DataFetchError
+
+
+class TestPublishedAtFrom:
+    """Epoch publish timestamp -> ISO-8601 UTC string."""
+
+    def test_published_at_from_epoch(self):
+        assert published_at_from(1786795200) == "2026-08-15T12:00:00Z"
+
+    def test_published_at_from_float_epoch(self):
+        assert published_at_from(1786795200.0) == "2026-08-15T12:00:00Z"
+
+    def test_published_at_from_missing(self):
+        assert published_at_from(None) is None
+
+    @pytest.mark.parametrize("bad", [10**20, float("nan"), float("inf"), "soon", [1]])
+    def test_published_at_from_unconvertible_returns_none(self, bad):
+        assert published_at_from(bad) is None
+
+
+class TestGetVideoMetadataTimestamp:
+    """get_video_metadata picks the public-availability time for published_at."""
+
+    @staticmethod
+    async def _metadata_for(info):
+        client = YouTubeClient(YouTubeClientConfig())
+        ydl = MagicMock()
+        ydl.__enter__.return_value.extract_info.return_value = info
+        with patch("connectors.youtube.client.yt_dlp.YoutubeDL", return_value=ydl):
+            return await client.get_video_metadata("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+
+    @pytest.mark.asyncio
+    async def test_prefers_release_timestamp_over_timestamp(self):
+        # Premiere: uploaded earlier than it went public.
+        meta = await self._metadata_for({"timestamp": 1786700000, "release_timestamp": 1786795200})
+        assert meta["timestamp"] == 1786795200
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_timestamp(self):
+        meta = await self._metadata_for({"timestamp": 1786795200})
+        assert meta["timestamp"] == 1786795200
 
 
 class TestYouTubeClientConfig:
@@ -278,10 +319,16 @@ class TestGetTranscriptSegments:
             {"start": 5.5, "text": "second segment"},
         ]
 
+    @pytest.fixture(autouse=True)
+    def _skip_ffmpeg_decode(self):
+        """The fake audio path is never decoded; the mocked model takes it as-is."""
+        with patch("connectors.youtube.client._decode_audio_ffmpeg", side_effect=lambda path: path):
+            yield
+
     @pytest.mark.asyncio
     async def test_whisper_path_retains_segments(self):
         """Whisper fallback path: segments carry .start / .text."""
-        config = YouTubeClientConfig(use_transcript_api=False)
+        config = YouTubeClientConfig(use_transcript_api=False, whisper_backend="faster-whisper")
         client = YouTubeClient(config)
 
         fake_segments = [
@@ -311,7 +358,7 @@ class TestGetTranscriptSegments:
     @pytest.mark.asyncio
     async def test_whisper_path_used_when_api_disabled(self):
         """When use_transcript_api is False, Whisper is used directly (no API call)."""
-        config = YouTubeClientConfig(use_transcript_api=False)
+        config = YouTubeClientConfig(use_transcript_api=False, whisper_backend="faster-whisper")
         client = YouTubeClient(config)
 
         client._whisper_model = MagicMock()
@@ -327,6 +374,35 @@ class TestGetTranscriptSegments:
 
         assert source == "whisper"
         assert segments == [{"start": 1.0, "text": "only segment"}]
+
+
+class TestDecodeAudioFfmpeg:
+    """Whisper input is decoded with the ffmpeg binary (PyAV >= 15 breaks faster-whisper)."""
+
+    def test_returns_path_when_ffmpeg_missing(self):
+        from connectors.youtube import client as yt_client
+
+        with patch("shutil.which", return_value=None):
+            assert yt_client._decode_audio_ffmpeg("/tmp/a.m4a") == "/tmp/a.m4a"
+
+    def test_decodes_to_16k_mono_float32(self, tmp_path):
+        import shutil
+        import subprocess
+        import numpy as np
+        from connectors.youtube import client as yt_client
+
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            pytest.skip("ffmpeg not installed")
+        wav = tmp_path / "tone.wav"
+        subprocess.run(
+            [ffmpeg, "-nostdin", "-loglevel", "error", "-f", "lavfi",
+             "-i", "sine=frequency=440:duration=1", "-ac", "2", "-ar", "44100", str(wav)],
+            check=True,
+        )
+        audio = yt_client._decode_audio_ffmpeg(str(wav))
+        assert audio.dtype == np.float32
+        assert abs(len(audio) - yt_client.WHISPER_SAMPLE_RATE) < 200
 
 
 class TestCollectorPopulatesTranscriptSegments:
@@ -369,6 +445,41 @@ class TestCollectorPopulatesTranscriptSegments:
         # New: per-segment timestamps retained for deep-linking
         assert video.transcript_segments == fake_segments
 
+    @pytest.mark.asyncio
+    async def test_process_video_sets_published_at_from_epoch(self):
+        config = YouTubeClientConfig(use_transcript_api=True)
+        collector = YouTubeCollector(config)
+
+        fake_metadata = {
+            "title": "Test Video",
+            "description": "",
+            "duration": 120,
+            "view_count": 0,
+            "like_count": 0,
+            "channel": "Chan",
+            "channel_id": "c1",
+            "upload_date": "20260815",
+            "timestamp": 1786795200,
+            "tags": [],
+            "categories": [],
+            "thumbnail": "",
+        }
+
+        collector.client.get_video_metadata = AsyncMock(return_value=fake_metadata)
+        collector.client.get_transcript = AsyncMock(
+            return_value=("hi there", "youtube_api", [])
+        )
+
+        spec = YouTubeCollectSpec(urls=["https://www.youtube.com/watch?v=dQw4w9WgXcQ"])
+        videos = await collector.fetch(spec)
+
+        assert len(videos) == 1
+        video = videos[0]
+        assert video.status == "success"
+        assert video.published_at == "2026-08-15T12:00:00Z"
+        # Existing date field unchanged
+        assert video.upload_date == "20260815"
+
 
 class TestFasterWhisperOptional:
     """faster-whisper is an OPTIONAL extra (pyproject.toml [youtube]/[all]).
@@ -408,7 +519,7 @@ class TestFasterWhisperOptional:
         faster-whisper is missing; Whisper fallback is disabled instead."""
         self._block_faster_whisper_import(monkeypatch)
 
-        config = YouTubeClientConfig(whisper_model="base")
+        config = YouTubeClientConfig(whisper_model="base", whisper_backend="faster-whisper")
 
         client = YouTubeClient(config)
         assert client._whisper_model is None
@@ -424,9 +535,286 @@ class TestFasterWhisperOptional:
         DataFetchError, not an AttributeError on None.transcribe(...)."""
         self._block_faster_whisper_import(monkeypatch)
 
-        config = YouTubeClientConfig(whisper_model="base", use_transcript_api=False)
+        config = YouTubeClientConfig(whisper_model="base", use_transcript_api=False, whisper_backend="faster-whisper")
         client = YouTubeClient(config)
         assert client._whisper_model is None
 
         with pytest.raises(DataFetchError, match="faster-whisper not installed"):
             await client.get_transcript("dQw4w9WgXcQ")
+
+
+class TestWhisperBackendResolution:
+    """_resolve_whisper_backend picks mlx / faster-whisper / disabled."""
+
+    @staticmethod
+    def _resolve(config, system, machine, mlx_importable):
+        from connectors.youtube.client import _resolve_whisper_backend
+
+        fake_mlx = MagicMock() if mlx_importable else None
+        # A None entry in sys.modules makes `import mlx_whisper` raise ImportError
+        with patch("connectors.youtube.client.platform.system", return_value=system), \
+             patch("connectors.youtube.client.platform.machine", return_value=machine), \
+             patch.dict(sys.modules, {"mlx_whisper": fake_mlx}):
+            return _resolve_whisper_backend(config)
+
+    def test_auto_picks_mlx_on_apple_silicon(self):
+        assert self._resolve(YouTubeClientConfig(), "Darwin", "arm64", True) == "mlx"
+
+    def test_auto_picks_faster_whisper_on_linux(self):
+        assert self._resolve(YouTubeClientConfig(), "Linux", "x86_64", True) == "faster-whisper"
+
+    def test_auto_falls_back_when_mlx_not_importable(self):
+        assert self._resolve(YouTubeClientConfig(), "Darwin", "arm64", False) == "faster-whisper"
+
+    def test_explicit_mlx_not_importable_falls_back(self):
+        cfg = YouTubeClientConfig(whisper_backend="mlx")
+        assert self._resolve(cfg, "Linux", "x86_64", False) == "faster-whisper"
+
+    def test_explicit_faster_whisper_ignores_mlx(self):
+        cfg = YouTubeClientConfig(whisper_backend="faster-whisper")
+        assert self._resolve(cfg, "Darwin", "arm64", True) == "faster-whisper"
+
+    @pytest.mark.parametrize("backend", ["auto", "mlx", "faster-whisper"])
+    def test_empty_whisper_model_disables_whisper(self, backend):
+        cfg = YouTubeClientConfig(whisper_model="", whisper_backend=backend)
+        assert self._resolve(cfg, "Darwin", "arm64", True) is None
+        client = YouTubeClient(cfg)
+        assert client._whisper_backend is None
+        assert client._whisper_model is None
+
+    def test_mlx_backend_does_not_load_faster_whisper(self):
+        with patch("connectors.youtube.client._resolve_whisper_backend", return_value="mlx"):
+            client = YouTubeClient(YouTubeClientConfig())
+        assert client._whisper_model is None
+        assert client._whisper_available()
+
+
+class TestMlxWhisperTranscription:
+    @pytest.mark.asyncio
+    async def test_mlx_path_returns_text_and_segments(self):
+        with patch("connectors.youtube.client._resolve_whisper_backend", return_value="mlx"):
+            client = YouTubeClient(YouTubeClientConfig(use_transcript_api=False))
+        fake_mlx = MagicMock()
+        fake_mlx.transcribe.return_value = {
+            "language": "en",
+            "segments": [
+                {"start": 0, "text": " Hello world "},
+                {"start": 2.5, "text": "   "},
+                {"start": 5.0, "text": " second "},
+            ],
+        }
+        with patch.dict(sys.modules, {"mlx_whisper": fake_mlx}), \
+             patch.object(client, "_download_audio", AsyncMock(return_value="/tmp/x.m4a")):
+            text, source, segments = await client.get_transcript("abc123")
+
+        assert source == "whisper"
+        assert text == "Hello world second"
+        assert segments == [
+            {"start": 0.0, "text": "Hello world"},
+            {"start": 5.0, "text": "second"},
+        ]
+        fake_mlx.transcribe.assert_called_once_with(
+            "/tmp/x.m4a",
+            path_or_hf_repo="mlx-community/whisper-large-v3-turbo",
+            language=None,
+        )
+
+
+class TestCaptionBlockHandling:
+    BLOCK_MSG = "IpBlocked: YouTube is blocking requests from your IP"
+
+    @staticmethod
+    def _client(whisper_ok=True):
+        cfg = YouTubeClientConfig(use_transcript_api=True, whisper_backend="faster-whisper")
+        client = YouTubeClient(cfg)
+        client._whisper_backend = "faster-whisper"
+        client._whisper_model = MagicMock()
+        return client
+
+    def test_is_block_error_markers(self):
+        from connectors.youtube.utils import is_block_error
+        from connectors.youtube.collector import _is_block_error
+
+        for msg in ["IpBlocked", "RequestBlocked", "Too Many Requests", "HTTP 429", "Sign in to confirm you're not a bot"]:
+            assert is_block_error(msg) and _is_block_error(msg)
+        assert not is_block_error("HTTP 4290 nope")
+        assert not is_block_error(None)
+
+    @pytest.mark.asyncio
+    async def test_block_error_skips_caption_api_for_next_video(self):
+        client = self._client()
+        api = MagicMock()
+        api.list.side_effect = Exception(self.BLOCK_MSG)
+        whisper = AsyncMock(return_value=("t", "whisper", []))
+        with patch("connectors.youtube.client.YouTubeTranscriptApi", return_value=api), \
+             patch.object(client, "_transcribe_with_whisper", whisper):
+            await client.get_transcript("vid1")
+            assert client._captions_blocked is True
+            await client.get_transcript("vid2")
+
+        assert api.list.call_count == 1
+        assert whisper.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_non_block_error_does_not_set_flag(self):
+        client = self._client()
+        api = MagicMock()
+        api.list.side_effect = Exception("No transcripts available for this video")
+        with patch("connectors.youtube.client.YouTubeTranscriptApi", return_value=api), \
+             patch.object(client, "_transcribe_with_whisper", AsyncMock(return_value=("t", "whisper", []))):
+            await client.get_transcript("vid1")
+            await client.get_transcript("vid2")
+        assert client._captions_blocked is False
+        assert api.list.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_caption_block_plus_whisper_failure_reports_both(self):
+        from connectors.youtube.collector import _is_block_error
+
+        client = self._client()
+        api = MagicMock()
+        api.list.side_effect = Exception(self.BLOCK_MSG)
+        whisper = AsyncMock(side_effect=DataFetchError("Whisper transcription failed: boom"))
+        with patch("connectors.youtube.client.YouTubeTranscriptApi", return_value=api), \
+             patch.object(client, "_transcribe_with_whisper", whisper):
+            with pytest.raises(DataFetchError) as exc:
+                await client.get_transcript("vid1")
+
+        msg = str(exc.value)
+        assert "IpBlocked" in msg and "boom" in msg
+        assert _is_block_error(msg)
+
+    @pytest.mark.asyncio
+    async def test_caption_block_with_whisper_unavailable_reports_block(self):
+        from connectors.youtube.collector import _is_block_error
+
+        client = YouTubeClient(YouTubeClientConfig(whisper_model="", use_transcript_api=True))
+        api = MagicMock()
+        api.list.side_effect = Exception(self.BLOCK_MSG)
+        with patch("connectors.youtube.client.YouTubeTranscriptApi", return_value=api):
+            with pytest.raises(DataFetchError) as exc:
+                await client.get_transcript("vid1")
+        assert _is_block_error(str(exc.value))
+
+
+class TestWhisperLanguage:
+    """The GPU transcriber is told the channel's language instead of guessing."""
+
+    @pytest.mark.parametrize("langs,expected", [
+        (["iw", "he"], "he"), (["en"], "en"), (["en-US"], "en"), ([], None),
+    ])
+    def test_language_from_config(self, langs, expected):
+        client = YouTubeClient(YouTubeClientConfig(
+            transcript_languages=langs, whisper_backend="faster-whisper"))
+        assert client._whisper_language() == expected
+
+
+class TestTranscriptCache:
+    """Each transcript is saved to disk as soon as it is fetched and reused later."""
+
+    @pytest.mark.asyncio
+    async def test_fetched_transcript_is_saved_and_reused(self, tmp_path):
+        import json as _json
+
+        client = YouTubeClient(YouTubeClientConfig(
+            transcript_cache_dir=str(tmp_path), whisper_backend="faster-whisper"))
+        fetch = AsyncMock(return_value=("hello world", "whisper", [{"start": 0.0, "text": "hello world"}]))
+        with patch.object(client, "_fetch_transcript", new=fetch):
+            first = await client.get_transcript("vid1")
+            second = await client.get_transcript("vid1")
+
+        assert first == second == ("hello world", "whisper", [{"start": 0.0, "text": "hello world"}])
+        assert fetch.await_count == 1  # second call came from disk
+        saved = _json.loads((tmp_path / "vid1.json").read_text(encoding="utf-8"))
+        assert saved["video_id"] == "vid1" and saved["transcript"] == "hello world"
+        assert saved["source"] == "whisper" and saved["segments"][0]["start"] == 0.0
+
+    @pytest.mark.asyncio
+    async def test_failed_fetch_saves_nothing(self, tmp_path):
+        client = YouTubeClient(YouTubeClientConfig(
+            transcript_cache_dir=str(tmp_path), whisper_backend="faster-whisper"))
+        with patch.object(client, "_fetch_transcript",
+                          new=AsyncMock(side_effect=DataFetchError("boom"))):
+            with pytest.raises(DataFetchError):
+                await client.get_transcript("vid2")
+        assert not list(tmp_path.iterdir())
+
+    @pytest.mark.asyncio
+    async def test_unreadable_cache_file_is_ignored(self, tmp_path):
+        (tmp_path / "vid3.json").write_text("{not json", encoding="utf-8")
+        client = YouTubeClient(YouTubeClientConfig(
+            transcript_cache_dir=str(tmp_path), whisper_backend="faster-whisper"))
+        fetch = AsyncMock(return_value=("fresh", "youtube_api", []))
+        with patch.object(client, "_fetch_transcript", new=fetch):
+            assert (await client.get_transcript("vid3"))[0] == "fresh"
+        assert fetch.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_no_cache_dir_means_no_files(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        client = YouTubeClient(YouTubeClientConfig(whisper_backend="faster-whisper"))
+        with patch.object(client, "_fetch_transcript",
+                          new=AsyncMock(return_value=("t", "youtube_api", []))):
+            await client.get_transcript("vid4")
+        assert not list(tmp_path.iterdir())
+
+
+class TestChannelDateCutoff:
+    """Channel videos older than days_back are skipped before download, and a
+    channel stops being fetched once its (newest-first) listing passes the cutoff."""
+
+    @staticmethod
+    def _meta(day: str) -> dict:
+        return {
+            "title": day, "description": "", "duration": 60, "view_count": 0,
+            "like_count": 0, "channel": "Chan", "channel_id": "c1",
+            "upload_date": day, "tags": [], "categories": [], "thumbnail": "",
+        }
+
+    @staticmethod
+    def _url(n: int) -> str:
+        return f"https://www.youtube.com/watch?v=vid{n:08d}"
+
+    def _collector(self, days: list):
+        from datetime import datetime, timedelta, timezone
+        collector = YouTubeCollector(YouTubeClientConfig(delay_seconds=0))
+        today = datetime.now(timezone.utc)
+        dates = {self._url(i): (today - timedelta(days=d)).strftime("%Y%m%d")
+                 for i, d in enumerate(days)}
+        collector.client.get_channel_videos = AsyncMock(return_value=list(dates))
+        collector.client.get_video_metadata = AsyncMock(
+            side_effect=lambda url: self._meta(dates[url]))
+        collector.client.get_transcript = AsyncMock(return_value=("text", "whisper", []))
+        return collector
+
+    @pytest.mark.asyncio
+    async def test_old_channel_videos_skipped_and_channel_stops(self):
+        # newest first: 2 in window, then 4 older than 30 days
+        collector = self._collector([1, 10, 40, 50, 60, 70])
+        videos = await collector.fetch(
+            YouTubeCollectSpec(channels=["@chan"], max_videos_per_channel=10, days_back=30))
+
+        assert [v.video_id for v in videos] == ["vid00000000", "vid00000001"]
+        assert all(v.status == "success" for v in videos)
+        assert collector.client.get_transcript.await_count == 2
+        # stops after CUTOFF_STREAK (3) consecutive old videos: 6th never fetched
+        assert collector.client.get_video_metadata.await_count == 5
+
+    @pytest.mark.asyncio
+    async def test_single_old_video_does_not_stop_channel(self):
+        collector = self._collector([1, 40, 2, 3])
+        videos = await collector.fetch(
+            YouTubeCollectSpec(channels=["@chan"], max_videos_per_channel=10, days_back=30))
+
+        assert [v.video_id for v in videos] == ["vid00000000", "vid00000002", "vid00000003"]
+
+    @pytest.mark.asyncio
+    async def test_direct_urls_not_date_filtered(self):
+        collector = YouTubeCollector(YouTubeClientConfig(delay_seconds=0))
+        collector.client.get_video_metadata = AsyncMock(return_value=self._meta("20100101"))
+        collector.client.get_transcript = AsyncMock(return_value=("text", "whisper", []))
+
+        videos = await collector.fetch(
+            YouTubeCollectSpec(urls=["https://www.youtube.com/watch?v=dQw4w9WgXcQ"], days_back=7))
+
+        assert len(videos) == 1 and videos[0].status == "success"

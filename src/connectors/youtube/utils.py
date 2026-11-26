@@ -3,6 +3,19 @@
 import re
 from typing import Optional
 
+_BLOCK_MARKERS = (
+    "sign in to confirm you",
+    "ipblocked",
+    "requestblocked",
+    "too many requests",
+)
+
+
+def is_block_error(error: Optional[object]) -> bool:
+    """True if an error message looks like a YouTube bot/IP block."""
+    text = str(error or "").lower()
+    return any(m in text for m in _BLOCK_MARKERS) or bool(re.search(r"\b429\b", text))
+
 
 def validate_youtube_url(url: str) -> bool:
     """Validate if URL is a valid YouTube video URL.

@@ -1,7 +1,7 @@
 """Pydantic models for Telegram connector."""
 
 from pydantic import BaseModel, Field
-from typing import List, Optional, Callable, Awaitable
+from typing import List, Optional, Callable, Awaitable, Union
 from datetime import datetime
 from connectors.common.config import BaseClientConfig, BaseCollectSpec
 
@@ -11,7 +11,7 @@ class TelegramClientConfig(BaseClientConfig):
 
     Uses callback pattern for non-interactive authentication.
     """
-    api_id: str = Field(..., description="Telegram API ID")
+    api_id: Union[int, str] = Field(..., description="Telegram API ID (int or numeric string)")
     api_hash: str = Field(..., description="Telegram API hash")
     session_name: str = Field(
         default="connector_session",
@@ -91,6 +91,26 @@ class TelegramMessage(BaseModel):
         default_factory=list,
         description="List of replies to this message"
     )
+    message_link: Optional[str] = Field(
+        default=None,
+        description="Public t.me link (None for numeric/private channel ids)"
+    )
 
     class Config:
         frozen = False
+
+
+def telegram_message_link(channel: str, message_id: int) -> Optional[str]:
+    """Build the public ``https://t.me/<username>/<id>`` link for a message.
+
+    Accepts ``name``, ``@name`` or ``t.me/name`` forms. Numeric ids (private
+    channels) have no public URL, so return None.
+    """
+    name = str(channel or "").strip()
+    for prefix in ("https://t.me/", "http://t.me/", "t.me/", "@"):
+        if name.startswith(prefix):
+            name = name[len(prefix):]
+    name = name.strip("/")
+    if not name or name.lstrip("-").isdigit():
+        return None
+    return f"https://t.me/{name}/{message_id}"

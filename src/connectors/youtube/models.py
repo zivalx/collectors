@@ -1,9 +1,20 @@
 """Pydantic models for YouTube connector."""
 
 from pydantic import BaseModel, Field, field_validator, model_validator
-from typing import List, Optional
-from datetime import datetime
+from typing import List, Literal, Optional
+from datetime import datetime, timezone
 from connectors.common.config import BaseClientConfig, BaseCollectSpec
+
+
+def published_at_from(timestamp: "int | float | None") -> Optional[str]:
+    """Convert an epoch timestamp to an ISO-8601 UTC string (YYYY-MM-DDTHH:MM:SSZ)."""
+    if timestamp is None:
+        return None
+    try:
+        return datetime.fromtimestamp(timestamp, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except (OverflowError, OSError, ValueError, TypeError):
+        # Out-of-range / non-numeric value: drop the publish time, keep the video.
+        return None
 
 
 class YouTubeClientConfig(BaseClientConfig):
@@ -14,6 +25,21 @@ class YouTubeClientConfig(BaseClientConfig):
     whisper_model: str = Field(
         default="base",
         description="Whisper model: tiny, base, small, medium, large"
+    )
+    whisper_backend: Literal["auto", "mlx", "faster-whisper"] = Field(
+        default="auto",
+        description="Whisper backend: auto (mlx on Apple Silicon if installed, else faster-whisper), mlx, or faster-whisper"
+    )
+    mlx_whisper_model: str = Field(
+        default="mlx-community/whisper-large-v3-turbo",
+        description="MLX Whisper model repo or path (used by the mlx backend)"
+    )
+    transcript_cache_dir: Optional[str] = Field(
+        default=None,
+        description=(
+            "Directory where each transcript is saved as <video_id>.json the moment "
+            "it is fetched, and reused on later runs instead of fetching again"
+        ),
     )
     max_video_length: int = Field(
         default=3600,
@@ -36,6 +62,18 @@ class YouTubeClientConfig(BaseClientConfig):
         description="Whisper compute type: int8, float16, float32"
     )
     timeout: int = Field(default=60, description="Request timeout in seconds")
+    max_concurrency: int = Field(
+        default=4, ge=1,
+        description="Maximum number of videos fetched concurrently"
+    )
+    delay_seconds: float = Field(
+        default=0.0, ge=0,
+        description="Randomized pause before each video fetch (uniform in [0.5x, 1.5x])"
+    )
+    cookies_file: Optional[str] = Field(
+        default=None,
+        description="Path to a Netscape cookies.txt used by yt-dlp and youtube-transcript-api"
+    )
 
 
 class YouTubeCollectSpec(BaseCollectSpec):
@@ -60,6 +98,10 @@ class YouTubeCollectSpec(BaseCollectSpec):
         default=7,
         ge=1,
         description="Only videos from last N days"
+    )
+    skip_video_ids: Optional[List[str]] = Field(
+        default=None,
+        description="Video ids to drop after listing; never fetched"
     )
 
     @model_validator(mode='after')
@@ -86,6 +128,10 @@ class YouTubeVideo(BaseModel):
     upload_date: Optional[str] = Field(
         default=None,
         description="Upload date in YYYYMMDD format"
+    )
+    published_at: Optional[str] = Field(
+        default=None,
+        description="Publish time, ISO-8601 UTC (YYYY-MM-DDTHH:MM:SSZ)"
     )
 
     # Stats

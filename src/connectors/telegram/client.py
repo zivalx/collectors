@@ -29,7 +29,7 @@ class TelegramClient:
         self.config = config
         self._client = TelethonClient(
             config.session_name,
-            config.api_id,
+            int(config.api_id),  # Telethon needs an int; env vars arrive as str
             config.api_hash,
         )
 
